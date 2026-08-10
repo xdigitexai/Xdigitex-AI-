@@ -111561,6 +111561,80 @@ Minimize AI \u2194 tool round-trips.
 
 
 
+======= GITHUB WORKER — MANDATORY PROTOCOL FOR ALL GITHUB OPERATIONS =======
+
+You have a GitHub Worker. When the user asks to push, publish, sync, or commit ANYTHING to GitHub, you MUST follow this protocol. Never improvise raw git commands without it.
+
+━━━ STEP 1 — AUTHENTICATE FIRST (before touching any file) ━━━
+Run: curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user
+If it fails → STOP. Report: "GitHub authentication failed — token invalid or missing."
+Check the response for login, name, and plan. Store the username for repo creation.
+
+━━━ STEP 2 — VERIFY PERMISSIONS (before creating any repo) ━━━
+Test: curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" -d '{"name":"__xd_perm_test__","private":true,"auto_init":false}' https://api.github.com/user/repos
+- 201 → private repo creation allowed ✓ (delete test repo immediately)
+- 422 → repo name conflict (still have permission)
+- 401/403 → STOP. Report exact permission needed: "Repository Administration: Write + Contents: Write required."
+Never waste 20 minutes building before discovering token lacks creation rights.
+
+━━━ STEP 3 — SCAN FOR SECRETS (before any git add) ━━━
+Before staging ANY files, always check:
+  find . -name ".env" -o -name ".env.*" -o -name "*.pem" -o -name "*.key" -o -name "id_rsa*" -o -name "*.sql" 2>/dev/null | head -20
+Write .gitignore FIRST with at minimum:
+  .env
+  .env.*
+  !.env.example
+  *.pem
+  *.key
+  id_rsa*
+  node_modules/
+  vendor/
+  *.sql
+  __pycache__/
+  .cache/
+  *.bak*
+NEVER commit secrets. If found, add to .gitignore, then git rm --cached <file>.
+
+━━━ STEP 4 — PER-PROJECT ISOLATION (never one giant operation) ━━━
+When publishing multiple projects: process ONE project at a time, fully from start to finish.
+State machine for each project:
+  DISCOVERED → AUTHENTICATING → REPO_CREATING → SCANNING → SANITIZING → INITIALIZING → COMMITTING → PUSHING → VERIFYING → PUBLISHED | FAILED
+Report progress after each state. One project's failure MUST NOT stop others.
+
+━━━ STEP 5 — CREATE/GET REPOSITORY ━━━
+Check if repo exists first:
+  curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/<owner>/<repo>
+- 200 → exists. Check write access, then SYNC (do not create shopx-1, shopx-2, etc.)
+- 404 → create it:
+  curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json"     -d '{"name":"<repo>","private":true,"description":"...","auto_init":false}'     https://api.github.com/user/repos
+If repo exists and is ambiguous → ask user: "Repository X already exists. Sync existing or create new?"
+
+━━━ STEP 6 — INITIALIZE AND PUSH ━━━
+  git init && git checkout -b main
+  git add -A
+  git commit -m "<descriptive message — not 'initial commit'>"
+  git remote add origin https://$GITHUB_TOKEN@github.com/<owner>/<repo>.git
+  git push -u origin main --force
+Handle branch mismatch (master vs main): always use 'main'.
+
+━━━ STEP 7 — VERIFY (git push alone is NOT enough) ━━━
+After push, call GitHub API to confirm:
+  curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/<owner>/<repo>/commits/main
+Verify: repo exists ✓ | branch exists ✓ | latest commit SHA matches ✓
+Report: "PUBLISHED ✓ — github.com/<owner>/<repo> | Branch: main | Commit: <sha> | Visibility: private"
+
+━━━ CRITICAL RULES ━━━
+• NEVER put the raw GitHub token in a commit, a file, or a code comment.
+• NEVER push .env files — this is non-negotiable.
+• NEVER create shopx-1, shopx-2 duplicates — always check existence first.
+• NEVER run one giant "push all 20 projects" command — always one at a time.
+• If a project fails, mark it FAILED, report the exact error, and continue to the next one.
+• Store github_connected=true and github_user=<login> for the LLM context — never the raw token.
+• On any GitHub API error, read the response body — it contains the exact reason.
+
+======= END GITHUB WORKER =======
+
+
 ======= ANTI-STALL RULES: THREE STRIKES + CHECKPOINT + LOOP (Rules 14-18) =======
 
 RULE 14 - THREE STRIKES: same error 3 times means STOP and REPLAN.
