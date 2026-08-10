@@ -108474,14 +108474,16 @@ function getAIClient(provider = "deepseek") {
   if (provider === "alibaba") return getAlibabaClient();
   return getDeepSeekClient();
 }
-function autoModel(_role) {
-  return "qwen-max";
+function autoModel(role) {
+  // nano for lightweight roles — preserve token budget; luna for heavy reasoning
+  if (role === "recovery" || role === "verifier") return "gpt-5.4-nano";
+  return "gpt-5.6-luna";
 }
 function autoProvider(_role) {
-  return "alibaba";
+  return "openai"; // OpenAI primary — shift to Alibaba if unavailable
 }
 function autoBackupModel(_role) {
-  return { provider: "openai", model: "gpt-5.6-luna" }; // luna backup for all roles
+  return { provider: "alibaba", model: "qwen-max" }; // Alibaba when OpenAI unavailable
 }
 function autoTertiaryModel(role) {
   if (role === "builder") return { provider: "nvidia", model: "deepseek-ai/deepseek-v4-flash" };
@@ -108493,10 +108495,13 @@ function autoQuaternaryModel(_role) {
   return { provider: "requesty", model: "google/gemini-2.5-flash" };
 }
 function universalLastResortModel() {
+  // During DeepSeek peak pricing (cost 2x), use OpenAI nano instead to save credits
+  if (isDeepSeekPeak()) return { provider: "openai", model: "gpt-5.4-nano" };
   return { provider: "deepseek", model: "deepseek-v4-pro" };
 }
 function cheapOpenAIModel() {
-  return { provider: "openai", model: "gpt-5.6-luna" }; // always luna
+  // nano for relief/backup calls — balance token usage, reserve luna for primary tasks
+  return { provider: "openai", model: "gpt-5.4-nano" };
 }
 var _deepseekJsonFails = 0;
 var _openaiReliefRemaining = 0;
