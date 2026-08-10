@@ -110548,8 +110548,22 @@ function scheduleAutolearn() {
         if (xd_t.status !== "running") continue;
         const xd_ms = xd_now - (xd_t.lastEmitAt ?? xd_t.startedAt?.getTime() ?? xd_now);
         if (xd_ms > 5 * 60 * 1000) {
-          chatTaskEmit(xd_t, "think", { text: `⏳ Supervisor: task silent for ${Math.round(xd_ms/60000)} min — agent is still working.` });
-          xd_t.lastEmitAt = xd_now;
+          xd_t._silenceStrikes = (xd_t._silenceStrikes || 0) + 1;
+          if (xd_t._silenceStrikes >= 3) {
+            // Hard kill after ~18 min silence — stuck on disk/net/quota issue
+            xd_t.abort.abort();
+            xd_t.status = 'failed';
+            const _stuckMin = Math.round(xd_ms / 60000);
+            chatTaskEmit(xd_t, 'reply', { text: '\u23F0 Task auto-cancelled after ' + _stuckMin + ' min with no progress (likely disk or network issue). Please start a new chat to retry.' });
+            chatTaskEmit(xd_t, 'run_failed', { runId: xd_t.runId, conversationId: xd_t.conversationId, status: 'failed', reason: 'Supervisor hard-kill: silent for ' + _stuckMin + ' min' });
+            chatTaskEmit(xd_t, 'stream_end', {});
+            if (xd_t.runId) { pool.query('UPDATE agent_runs SET status=$1, completed_at=NOW() WHERE run_id=$2', ['failed', xd_t.runId]).catch(()=>{}); }
+          } else {
+            chatTaskEmit(xd_t, 'think', { text: '\u23F3 Supervisor: task silent for ' + Math.round(xd_ms/60000) + ' min. Strike ' + xd_t._silenceStrikes + '/3 before auto-cancel.' });
+            xd_t.lastEmitAt = xd_now;
+          }
+        } else {
+          xd_t._silenceStrikes = 0;
         }
       }
     } catch {}
@@ -115370,10 +115384,25 @@ router8.post("/:id/chat", async (req, res) => {
     const _existingTask = [...chatTaskStore.values()].find(
       t => t.conversationId === conversationId && t.serverId === s2.id && t.status === "running"
     );
+    // Fresh conversationId = new chat. Cancel any stale tasks for this server
+    // that have been silent >5 min so 'start new chat' actually starts fresh.
+    if (!_existingTask) {
+      for (const _stale of [...chatTaskStore.values()]) {
+        if (_stale.serverId === s2.id && _stale.status === 'running' && (Date.now() - (_stale.lastEmitAt ?? 0)) > 5 * 60 * 1e3) {
+          _stale.abort.abort();
+          _stale.status = 'cancelled';
+          chatTaskEmit(_stale, 'reply', { text: 'Previous task cancelled \u2014 starting fresh.' });
+          chatTaskEmit(_stale, 'run_failed', { runId: _stale.runId, conversationId: _stale.conversationId, status: 'cancelled', reason: 'Superseded by new chat' });
+          chatTaskEmit(_stale, 'stream_end', {});
+          if (_stale.runId) { pool.query('UPDATE agent_runs SET status=$1, completed_at=NOW() WHERE run_id=$2', ['cancelled', _stale.runId]).catch(()=>{}); }
+        }
+      }
+    }
     if (_existingTask && _incomingText) {
       const _lc = _incomingText.toLowerCase();
-      const _isStop = /^(stop|cancel|abort|halt|quit|pause|end|kill|no more|stop it|stop that|enough|nevermind|never mind|forget it)[\.!\?\s]*$/.test(_lc)
-        || /\b(stop the task|cancel the task|stop everything|cancel everything|stop working|abort the task)\b/.test(_lc);
+      const _lc_clean = _lc.replace(/^[\s\"'`#@!\?]+|[\s\"'`#@!\?]+$/g, '').trim();
+      const _isStop = /^(stop|cancel|abort|halt|quit|pause|end|kill|no more|stop it|stop that|enough|nevermind|never mind|forget it)[\.!\?\s]*$/.test(_lc_clean)
+        || /\b(stop the task|cancel the task|stop everything|cancel everything|stop working|abort the task|stop now|cancel now|stop please)\b/.test(_lc);
 
       if (_isStop) {
         // Hard stop: abort the running task
