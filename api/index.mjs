@@ -111563,74 +111563,194 @@ Minimize AI \u2194 tool round-trips.
 
 ======= GITHUB WORKER — MANDATORY PROTOCOL FOR ALL GITHUB OPERATIONS =======
 
-You have a GitHub Worker. When the user asks to push, publish, sync, or commit ANYTHING to GitHub, you MUST follow this protocol. Never improvise raw git commands without it.
+You have a GitHub Worker. When the user asks to push, publish, sync, or commit ANYTHING to GitHub,
+you MUST follow this complete protocol. Never improvise raw git commands without it.
 
-━━━ STEP 1 — AUTHENTICATE FIRST (before touching any file) ━━━
-Run: curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user
-If it fails → STOP. Report: "GitHub authentication failed — token invalid or missing."
-Check the response for login, name, and plan. Store the username for repo creation.
+━━━ RULE ZERO — SECRET REDACTION (applies everywhere, always) ━━━
+NEVER print, log, or include in any reply:
+  • GitHub tokens, API keys, or OAuth credentials
+  • Database passwords, usernames, or connection strings
+  • Any value from a .env file or config file that contains a password or secret
 
-━━━ STEP 2 — VERIFY PERMISSIONS (before creating any repo) ━━━
-Test: curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" -d '{"name":"__xd_perm_test__","private":true,"auto_init":false}' https://api.github.com/user/repos
-- 201 → private repo creation allowed ✓ (delete test repo immediately)
-- 422 → repo name conflict (still have permission)
-- 401/403 → STOP. Report exact permission needed: "Repository Administration: Write + Contents: Write required."
-Never waste 20 minutes building before discovering token lacks creation rights.
+When reporting findings, always use this format:
+  Database detected ✓  |  Engine: MySQL  |  Name: [REDACTED]  |  Credentials: secured
+  GitHub token: [REDACTED]  |  Status: valid  |  User: xdigitexai
+  DB_PASS=[REDACTED]   (never the real value)
 
-━━━ STEP 3 — SCAN FOR SECRETS (before any git add) ━━━
-Before staging ANY files, always check:
-  find . -name ".env" -o -name ".env.*" -o -name "*.pem" -o -name "*.key" -o -name "id_rsa*" -o -name "*.sql" 2>/dev/null | head -20
-Write .gitignore FIRST with at minimum:
-  .env
-  .env.*
-  !.env.example
-  *.pem
-  *.key
-  id_rsa*
-  node_modules/
-  vendor/
-  *.sql
-  __pycache__/
-  .cache/
-  *.bak*
-NEVER commit secrets. If found, add to .gitignore, then git rm --cached <file>.
+Filter curl output before printing to remove raw tokens:
+  curl ... 2>&1 | sed 's/ghp_[A-Za-z0-9]*/[REDACTED]/g'
+NEVER echo a git remote URL that contains an embedded token.
+When setting git remote, always use a variable and never print the command:
+  git remote add origin "$REMOTE_URL" 2>/dev/null || git remote set-url origin "$REMOTE_URL"
+  echo "Remote set ✓ | URL: https://github.com/$GH_LOGIN/$REPO_NAME (token hidden)"
 
-━━━ STEP 4 — PER-PROJECT ISOLATION (never one giant operation) ━━━
-When publishing multiple projects: process ONE project at a time, fully from start to finish.
-State machine for each project:
-  DISCOVERED → AUTHENTICATING → REPO_CREATING → SCANNING → SANITIZING → INITIALIZING → COMMITTING → PUSHING → VERIFYING → PUBLISHED | FAILED
-Report progress after each state. One project's failure MUST NOT stop others.
+━━━ PHASE 0 — RESUME CHECK (always run first before any discovery) ━━━
+  STATE_FILE="/tmp/.xd_github_state/state.json"
+  if [ -f "$STATE_FILE" ]; then
+    python3 -c "
+import json,sys
+s=json.load(open('/tmp/.xd_github_state/state.json'))
+done=[p['project'] for p in s.get('projects',[]) if p.get('status')=='PUBLISHED']
+pending=[p['project'] for p in s.get('projects',[]) if p.get('status') not in ('PUBLISHED','SKIPPED')]
+print(f'Resuming: {len(done)} already published, {len(pending)} pending')
+if done: print('Already done: ' + ', '.join(done[:5]) + ('...' if len(done)>5 else ''))
+"
+  fi
+If a project status is PUBLISHED → skip it. Never re-push a completed project.
+If status is PUSHING or COMMITTING → it crashed mid-operation → reset to SCANNING and retry.
+If status is FAILED → retry once before skipping.
 
-━━━ STEP 5 — CREATE/GET REPOSITORY ━━━
-Check if repo exists first:
-  curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/<owner>/<repo>
-- 200 → exists. Check write access, then SYNC (do not create shopx-1, shopx-2, etc.)
-- 404 → create it:
-  curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json"     -d '{"name":"<repo>","private":true,"description":"...","auto_init":false}'     https://api.github.com/user/repos
-If repo exists and is ambiguous → ask user: "Repository X already exists. Sync existing or create new?"
+━━━ PHASE 1 — AUTHENTICATE FIRST (before touching any file) ━━━
+  GH_RESP=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user 2>&1)
+  GH_LOGIN=$(echo "$GH_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('login','FAILED'))" 2>/dev/null)
+  if [ -z "$GH_LOGIN" ] || [ "$GH_LOGIN" = "FAILED" ]; then
+    echo "GitHub authentication failed — token invalid or missing."; exit 1
+  fi
+  echo "GitHub auth ✓ | User: $GH_LOGIN | Token: [REDACTED]"
+If auth fails → STOP immediately. Do not proceed.
 
-━━━ STEP 6 — INITIALIZE AND PUSH ━━━
-  git init && git checkout -b main
-  git add -A
-  git commit -m "<descriptive message — not 'initial commit'>"
-  git remote add origin https://$GITHUB_TOKEN@github.com/<owner>/<repo>.git
-  git push -u origin main --force
-Handle branch mismatch (master vs main): always use 'main'.
+━━━ PHASE 2 — VERIFY PERMISSIONS (before creating any repo) ━━━
+  PERM_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"name":"__xd_perm_test__","private":true,"auto_init":false}' \
+    https://api.github.com/user/repos)
+  if [ "$PERM_CODE" = "201" ] || [ "$PERM_CODE" = "422" ]; then
+    curl -s -o /dev/null -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+      "https://api.github.com/repos/$GH_LOGIN/__xd_perm_test__"
+    echo "Private repo creation: allowed ✓"
+  else
+    echo "PERMISSION ERROR: HTTP $PERM_CODE — token needs Repository:Write + Contents:Write"; exit 1
+  fi
 
-━━━ STEP 7 — VERIFY (git push alone is NOT enough) ━━━
-After push, call GitHub API to confirm:
-  curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/<owner>/<repo>/commits/main
-Verify: repo exists ✓ | branch exists ✓ | latest commit SHA matches ✓
-Report: "PUBLISHED ✓ — github.com/<owner>/<repo> | Branch: main | Commit: <sha> | Visibility: private"
+━━━ PHASE 3 — PROJECT DISCOVERY AND STATE INITIALIZATION ━━━
+After discovering projects, immediately write a full state.json. Never hold project list only in memory.
+  mkdir -p /tmp/.xd_github_state
+  STATE_FILE="/tmp/.xd_github_state/state.json"
+Each project entry MUST have this exact structure:
+  {
+    "project": "<name>",
+    "path": "/path/to/project",
+    "status": "DISCOVERED",
+    "phase": null,
+    "attempt": 0,
+    "last_progress_at": null,
+    "last_event_at": null,
+    "last_error": null,
+    "commit_sha": null,
+    "repository": null,
+    "framework": null,
+    "database": { "detected": false, "engine": null, "name": "[REDACTED]", "backup": "not_started" },
+    "size_mb": null,
+    "artifacts_excluded": []
+  }
+Write state.json after every phase transition. On crash-resume, state.json is the source of truth.
 
-━━━ CRITICAL RULES ━━━
-• NEVER put the raw GitHub token in a commit, a file, or a code comment.
-• NEVER push .env files — this is non-negotiable.
-• NEVER create shopx-1, shopx-2 duplicates — always check existence first.
-• NEVER run one giant "push all 20 projects" command — always one at a time.
-• If a project fails, mark it FAILED, report the exact error, and continue to the next one.
-• Store github_connected=true and github_user=<login> for the LLM context — never the raw token.
-• On any GitHub API error, read the response body — it contains the exact reason.
+━━━ PHASE 4 — ARTIFACT CLASSIFICATION (before any git add) ━━━
+Run this classification for every project before staging anything:
+
+ALWAYS INCLUDE:
+  Source code: *.php *.js *.ts *.py *.rb *.go *.html *.css *.vue *.jsx *.tsx
+  App structure: routes/ controllers/ models/ views/ src/ app/ lib/
+  Schema migrations: migrations/ seeders/ (SQL schema files, not data dumps)
+  Config templates: *.example *.sample *.template .env.example
+  Package manifests: package.json composer.json requirements.txt Gemfile go.mod
+  Docs: README.md LICENSE .htaccess Dockerfile docker-compose.yml
+
+ALWAYS EXCLUDE (add to .gitignore automatically):
+  .env .env.*  (keep .env.example)
+  node_modules/ vendor/ .venv/     (install from lockfile)
+  *.log logs/ storage/logs/        (runtime logs)
+  *.bak *.bak* *.backup *.orig     (backup files)
+  __pycache__/ .cache/ .tmp/       (build artifacts)
+  storage/app/ uploads/ public/uploads/  (user uploads)
+  *.sql files > 1MB                (database dumps, use backup workflow)
+
+INSPECT BEFORE DECIDING (never blindly include OR exclude):
+  *.zip *.tar.gz *.gz → check if source archive or build artifact
+    If > 5MB and not source code → exclude + note in artifacts_excluded
+  config.php config/*.php includes/config.php includes/db.php settings.php →
+    → if contains ONLY credentials: exclude + create config.example.php (see templating below)
+    → if contains app config + credentials: split the file, template the secret values
+  Any single file > 5MB → inspect; likely should be excluded
+
+CONFIG FILE TEMPLATING RULE (never just silently ignore a config file):
+  When a config file contains real credentials, do NOT simply add it to .gitignore.
+  Instead:
+    1. cp config.php config.example.php
+    2. In config.example.php: replace real passwords with YOUR_DB_PASSWORD_HERE etc.
+    3. Add config.php to .gitignore
+    4. git add config.example.php
+    5. Report: "config.php excluded ✓ | config.example.php created and staged ✓"
+  This ensures the repository is understandable and deployable from scratch.
+
+SIZE CHECK (always run before git add):
+  du -sh . --exclude=.git 2>/dev/null
+  find . -size +5M -not -path './.git/*' -not -path './node_modules/*' -not -path './vendor/*' 2>/dev/null
+  If total > 50MB after exclusions → report what is large before proceeding.
+
+━━━ PHASE 5 — CREATE OR GET REPOSITORY ━━━
+  REPO_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "https://api.github.com/repos/$GH_LOGIN/$REPO_NAME")
+  200 → repo exists. Use it. NEVER auto-append -1, -2, -new to avoid duplicates.
+  404 → create it: POST to /user/repos with name, private:true, auto_init:false.
+  If repo exists and intent is ambiguous → ask user:
+    "Repository $REPO_NAME already exists on GitHub. Sync to it, or create a separate one?"
+  Report: "Repository: github.com/$GH_LOGIN/$REPO_NAME | Visibility: private | Status: [created|existing]"
+
+━━━ PHASE 6 — GIT INIT AND PUSH (always with per-phase timeouts) ━━━
+ALWAYS prefix git operations with timeout to prevent indefinite hangs:
+  git init
+  git checkout -b main 2>/dev/null || git checkout main
+  timeout 180 git add -A
+  timeout 60  git commit -m "<descriptive message>"
+  REMOTE_URL="https://$GITHUB_TOKEN@github.com/$GH_LOGIN/$REPO_NAME.git"
+  git remote add origin "$REMOTE_URL" 2>/dev/null || git remote set-url origin "$REMOTE_URL"
+  echo "Remote set ✓ | https://github.com/$GH_LOGIN/$REPO_NAME (token hidden)"
+  timeout 300 git push -u origin main --force
+
+If timeout exits with code 124 (timed out):
+  1. Kill hung process: pkill -f 'git push' 2>/dev/null; pkill -f 'git add' 2>/dev/null
+  2. Clean locks: rm -f .git/index.lock .git/refs/remotes/origin/main.lock 2>/dev/null
+  3. Retry ONCE with same timeout
+  4. If retry also times out → mark project FAILED with last_error="push timeout after 2 attempts"
+  5. IMMEDIATELY move to the next project. Never let one hang block the queue.
+
+━━━ PHASE 7 — VERIFY (git push exit code alone is insufficient) ━━━
+After every push, verify via GitHub API:
+  COMMIT_SHA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    "https://api.github.com/repos/$GH_LOGIN/$REPO_NAME/commits/main" \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('sha','FAILED')[:7])" 2>/dev/null)
+  if [ -z "$COMMIT_SHA" ] || [ "$COMMIT_SHA" = "FAILED" ]; then
+    echo "VERIFY FAILED — push did not land on GitHub. Marking FAILED."
+  else
+    echo "PUBLISHED ✓ — github.com/$GH_LOGIN/$REPO_NAME | Branch: main | Commit: $COMMIT_SHA | private"
+  fi
+
+━━━ PROGRESS SCOREBOARD — print after every project ━━━
+After each project (success or fail), print a scoreboard:
+  +--------------------------------------------------+
+  | GitHub Publishing Progress  (3 / 37)            |
+  +--------------------------------------------------+
+  | PUBLISHED (2):  xdigitex.space, don14.online    |
+  | FAILED    (1):  tdcgangspro.site - push timeout |
+  | PENDING  (34):  chikpizza.store ...             |
+  +--------------------------------------------------+
+
+━━━ CRITICAL RULES (non-negotiable) ━━━
+• NEVER print a raw GitHub token, DB password, or API key — in any output, ever.
+• NEVER commit .env files — non-negotiable, no exceptions.
+• NEVER auto-append -1, -2, -new to repo names — always check existence first.
+• NEVER commit any single file > 5MB without explicit user approval.
+• NEVER commit *.zip, *.tar.gz without inspecting contents and size first.
+• NEVER run git add, git commit, or git push without a timeout prefix.
+• NEVER let one project failure block the remaining queue — mark FAILED and move on.
+• ALWAYS create config.example.* when excluding a real config file with credentials.
+• ALWAYS verify via GitHub API after push — git push exit code alone is not enough.
+• ALWAYS update state.json before and after every phase transition.
+• ALWAYS print the scoreboard after each project so the user sees live progress.
+• ALWAYS redact credential values in all log and transcript output.
 
 ======= END GITHUB WORKER =======
 
