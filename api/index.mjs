@@ -115361,6 +115361,55 @@ router8.post("/:id/chat", async (req, res) => {
   const conversationId = (parsed.data.conversationId && typeof parsed.data.conversationId === 'string' && parsed.data.conversationId.length > 4)
     ? parsed.data.conversationId
     : ('conv_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36));
+  // ── CHAT CONTROLLER INTERCEPT ────────────────────────────────────────────
+  // If there is already a running task for this conversation, route the new
+  // message into it instead of spawning a second full agent loop.
+  {
+    const _incomingMsg = parsed.data.messages[parsed.data.messages.length - 1];
+    const _incomingText = (_incomingMsg && _incomingMsg.content ? _incomingMsg.content : "").trim();
+    const _existingTask = [...chatTaskStore.values()].find(
+      t => t.conversationId === conversationId && t.serverId === s2.id && t.status === "running"
+    );
+    if (_existingTask && _incomingText) {
+      const _lc = _incomingText.toLowerCase();
+      const _isStop = /^(stop|cancel|abort|halt|quit|pause|end|kill|no more|stop it|stop that|enough|nevermind|never mind|forget it)[\.!\?\s]*$/.test(_lc)
+        || /\b(stop the task|cancel the task|stop everything|cancel everything|stop working|abort the task)\b/.test(_lc);
+
+      if (_isStop) {
+        // Hard stop: abort the running task
+        _existingTask.abort.abort();
+        _existingTask.status = "cancelled";
+        chatTaskEmit(_existingTask, "reply", { text: "Task stopped. How can I help you next?" });
+        chatTaskEmit(_existingTask, "run_failed", { runId: _existingTask.runId, conversationId, status: "cancelled", reason: "User cancelled via chat" });
+        chatTaskEmit(_existingTask, "stream_end", {});
+        if (_existingTask.runId) {
+          pool.query("UPDATE agent_runs SET status='cancelled', completed_at=NOW() WHERE run_id=$1", [_existingTask.runId]).catch(() => {});
+        }
+        return res.json({ taskId: _existingTask.id, runId: _existingTask.runId, conversationId, intercepted: true });
+      }
+
+      // STATUS queries — respond without spawning a new task
+      const _isStatus = /\b(status|progress|what are you doing|what.s happening|how is it going|still running|are you done|done yet|finished yet)\b/.test(_lc);
+      if (_isStatus) {
+        const _elapsed = Math.round((Date.now() - _existingTask.startedAt.getTime()) / 1000);
+        const _lastAct = _existingTask.lastAction ? _existingTask.lastAction.slice(0, 120) : "processing";
+        chatTaskEmit(_existingTask, "reply", {
+          text: "Task still running (" + _elapsed + "s). Last action: " + _lastAct + ". Send \"stop\" to cancel, or your next instruction to redirect."
+        });
+        return res.json({ taskId: _existingTask.id, runId: _existingTask.runId, conversationId, intercepted: true });
+      }
+
+      // New instruction while task is running: inject into the task's queue
+      // and acknowledge immediately — the loop will pick it up on its next iteration
+      _existingTask.newUserMessages.push(_incomingText);
+      chatTaskEmit(_existingTask, "reply", {
+        text: "Got it. I\'ll incorporate your instruction into the current task: \"" + _incomingText.slice(0, 120) + "\""
+      });
+      return res.json({ taskId: _existingTask.id, runId: _existingTask.runId, conversationId, intercepted: true });
+    }
+  }
+  // ── END CHAT CONTROLLER INTERCEPT ────────────────────────────────────────
+
   const task = {
     id: taskId,
     serverId: s2.id,
@@ -115375,7 +115424,8 @@ router8.post("/:id/chat", async (req, res) => {
     timeline: [],
     lastAction: "",
     lastEmitAt: Date.now(),
-    filesModified: []
+    filesModified: [],
+    newUserMessages: []
   };
   task.runId = runId;
   task.conversationId = conversationId;
@@ -116103,6 +116153,20 @@ Tell the user to check that the agent script is still running in their terminal 
       };
       let hasAddedMaxStepsWarning = false;
       for (let iter = 0; iter < 80; iter++) {
+        // ── Check for new user messages injected via chat intercept ──
+        if (task.newUserMessages && task.newUserMessages.length > 0) {
+          const _newMsg = task.newUserMessages.shift();
+          const _newLc = _newMsg.toLowerCase();
+          const _isNewStop = /^(stop|cancel|abort|halt|quit|pause)/.test(_newLc)
+            || /\b(stop the task|cancel the task|stop everything|abort)\b/.test(_newLc);
+          if (_isNewStop) {
+            send2("reply", { text: "Stopping as requested." });
+            break;
+          }
+          // Inject new instruction as a user turn so the AI acts on it
+          aiMessages.push({ role: "user", content: "[NEW USER INSTRUCTION]\n" + _newMsg });
+          send2("think", { text: "New instruction received: " + _newMsg.slice(0, 80) });
+        }
         let iterModel = baseModel;
         let iterClient = getAIClient(baseProvider);
         if (_openaiReliefRemaining > 0 && process.env["OPENAI_API_KEY"]) {
