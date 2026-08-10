@@ -1,0 +1,17 @@
+node_modules/
+.cache/
+*.bak*
+*.bak2
+dist/
+.pnpm-store/
+pino-file.mjs
+pino-file.mjs.map
+pino-pretty.mjs
+pino-pretty.mjs.map
+pino-worker.mjs
+pino-worker.mjs.map
+thread-stream-worker.mjs
+thread-stream-worker.mjs.map
+screenshot_test.mjs
+index.mjs.map
+desktop-agent.js

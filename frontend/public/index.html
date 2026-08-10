@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- Primary SEO -->
+    <title>Xdigitex AI – AI Coding Agent, Browser Automation, Job Search &amp; DevOps Assistant</title>
+    <meta name="description" content="Xdigitex AI is an AI agent that helps developers and businesses code, debug, automate workflows, search jobs, deploy to VPS, connect over SSH, automate browsers, manage websites, and build professional applications from a single workspace." />
+    <meta name="keywords" content="AI Agent, Autonomous AI Agent, AI Coding Assistant, AI Coding Agent, Browser Automation, DevOps AI, AI Developer, Website Builder AI, Website Rebuilder, AI Automation, SSH AI, VPS Management AI, cPanel Automation, AI Website Migration, Job Search AI, AI Resume Assistant, AI YouTube Automation, AI Twitter Automation, Git Automation, AI Workspace, Cloud AI Agent, AI Developer Platform, Browser AI, AI Programming Assistant, AI Code Generator, AI Debugger, AI Deployment Assistant, AI Server Management, Workflow Automation, AI Productivity" />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://agent.xdigitex.com/" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://agent.xdigitex.com/" />
+    <meta property="og:site_name" content="Xdigitex AI" />
+    <meta property="og:title" content="Xdigitex AI – Autonomous AI Agent for Coding, Automation &amp; DevOps" />
+    <meta property="og:description" content="Build software, automate workflows, manage servers, search jobs, and complete complex tasks with Xdigitex AI." />
+    <meta property="og:image" content="https://agent.xdigitex.com/logo.jpg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:locale" content="en_US" />
+
+    <!-- Twitter / X Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@xdigitex" />
+    <meta name="twitter:title" content="Xdigitex AI – Autonomous AI Agent for Coding, Automation &amp; DevOps" />
+    <meta name="twitter:description" content="Code. Automate. Deploy. Grow. Xdigitex AI helps developers and businesses automate coding, browser workflows, DevOps, website management, and productivity from one AI workspace." />
+    <meta name="twitter:image" content="https://agent.xdigitex.com/logo.jpg" />
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/jpeg" href="/logo.jpg" />
+    <link rel="apple-touch-icon" href="/logo.jpg" />
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+    <!-- Schema.org structured data -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "Xdigitex AI",
+      "url": "https://agent.xdigitex.com",
+      "description": "Xdigitex AI is an autonomous AI agent that helps developers and businesses code, debug, automate workflows, search jobs, deploy to VPS, connect over SSH, automate browsers, manage websites, and build professional applications from a single workspace.",
+      "applicationCategory": "DeveloperApplication",
+      "additionalType": ["BusinessApplication", "ProductivityApplication"],
+      "operatingSystem": "Web",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "featureList": [
+        "AI Coding Assistant",
+        "Browser Automation",
+        "Website Builder",
+        "SSH & DevOps",
+        "VPS Management",
+        "Job Search AI",
+        "YouTube Automation",
+        "X (Twitter) Automation",
+        "Workflow Automation",
+        "API & SDK"
+      ],
+      "publisher": {
+        "@type": "Organization",
+        "name": "Xdigitex",
+        "url": "https://xdigitex.ai"
+      }
+    }
+    </script>
+    <script type="module" crossorigin src="/assets/index-xdxV2Build.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-EjzIhcSP.css">
+  <!-- xd-conv-shim -->
+<script>
+(function() {
+  'use strict';
+  // ── XD Conversation Persistence Shim ─────────────────────────────────────
+  // Stores conversationId per server so each new message reuses the same conversation.
+  // Also stores runId so we can poll /runs/:runId to recover from stuck "Working..." state.
+
+  const store = {
+    getConv: (sid) => sessionStorage.getItem('_xd_conv_' + sid) || null,
+    setConv: (sid, cid) => sessionStorage.setItem('_xd_conv_' + sid, cid),
+    getRun:  (sid) => sessionStorage.getItem('_xd_run_' + sid) || null,
+    setRun:  (sid, rid) => sessionStorage.setItem('_xd_run_' + sid, rid),
+    getTask: (sid) => sessionStorage.getItem('_xd_task_' + sid) || null,
+    setTask: (sid, tid) => sessionStorage.setItem('_xd_task_' + sid, tid),
+  };
+
+  // Expose globally for devtools debugging
+  window.XD_CONV = {
+    getState: (serverId) => ({
+      conversationId: store.getConv(serverId),
+      runId: store.getRun(serverId),
+      taskId: store.getTask(serverId),
+    }),
+    clearConv: (serverId) => {
+      sessionStorage.removeItem('_xd_conv_' + serverId);
+      sessionStorage.removeItem('_xd_run_' + serverId);
+      sessionStorage.removeItem('_xd_task_' + serverId);
+      console.log('[XD] Conversation cleared for server', serverId);
+    },
+    pollRunStatus: async (serverId, runId, token) => {
+      try {
+        const r = await fetch(`/api/servers/${serverId}/runs/${runId}`, {
+          headers: token ? { Authorization: 'Bearer ' + token } : {}
+        });
+        if (!r.ok) return null;
+        return await r.json();
+      } catch { return null; }
+    }
+  };
+
+  const _origFetch = window.fetch.bind(window);
+
+  window.fetch = async function(input, init) {
+    const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
+
+    // ── Intercept POST /api/servers/:id/chat ─────────────────────────────
+    const chatMatch = url.match(/\/api\/servers\/(\d+)\/chat$/);
+    if (chatMatch && (!init?.method || init.method.toUpperCase() === 'POST')) {
+      const serverId = chatMatch[1];
+      const storedConvId = store.getConv(serverId);
+
+      // Inject conversationId into request body
+      if (storedConvId && init?.body) {
+        try {
+          const body = JSON.parse(init.body);
+          if (!body.conversationId) {
+            body.conversationId = storedConvId;
+            init = { ...init, body: JSON.stringify(body) };
+          }
+        } catch (_e) {}
+      }
+
+      // Make the real request
+      const response = await _origFetch(input, init);
+
+      // Clone to read body without consuming it
+      const clone = response.clone();
+      clone.json().then(data => {
+        if (data?.conversationId) store.setConv(serverId, data.conversationId);
+        if (data?.runId)          store.setRun(serverId, data.runId);
+        if (data?.taskId)         store.setTask(serverId, data.taskId);
+      }).catch(() => {});
+
+      return response;
+    }
+
+    return _origFetch(input, init);
+  };
+
+  // ── Watchdog: poll /runs/:runId on page visibility to recover stuck UI ──
+  // When the page comes back into focus after being hidden, check if the
+  // current run is actually done. If so, fire a custom event that listeners can use.
+  let _watchdogTimer = null;
+  const _startWatchdog = () => {
+    if (_watchdogTimer) return;
+    _watchdogTimer = setInterval(async () => {
+      // Find all active server contexts (ones that have a stored run)
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i);
+        if (!key?.startsWith('_xd_run_')) continue;
+        const sid = key.replace('_xd_run_', '');
+        const rid = sessionStorage.getItem(key);
+        if (!rid) continue;
+        try {
+          const r = await _origFetch(`/api/servers/${sid}/runs/${rid}`);
+          if (!r.ok) continue;
+          const data = await r.json();
+          if (data?.status && data.status !== 'running') {
+            // Run is done — dispatch event so React can react
+            window.dispatchEvent(new CustomEvent('xd:run_completed', {
+              detail: { serverId: sid, runId: rid, status: data.status }
+            }));
+            // Clear the stored run so we don't keep polling
+            sessionStorage.removeItem('_xd_run_' + sid);
+          }
+        } catch (_e) {}
+      }
+    }, 15000); // poll every 15s
+  };
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') _startWatchdog();
+  });
+  _startWatchdog();
+
+  console.log('[XD] Conversation persistence shim loaded. Use window.XD_CONV for debugging.');
+})();
+</script>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
