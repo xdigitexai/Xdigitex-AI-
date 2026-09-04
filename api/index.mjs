@@ -116055,7 +116055,9 @@ void (async () => {
       } catch {}
       // ─────────────────────────────────────────────────────────────────────
       }
-      var xd_finalSysPrompt = xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt;
+      const xd_readOnlyTask = /\b(check|inspect|status|report|show|list|verify|diagnose)\b/i.test(userTaskText) && !/\b(fix|change|modify|write|create|install|restart|reload|deploy|delete|remove|update|configure)\b/i.test(userTaskText);
+      const xd_compactServerPrompt = `You are XDIGITEX Server Agent connected only to ${s2.username}@${s2.host}:${s2.port}. Complete the user's read-only request autonomously. Use the minimum targeted commands and never modify files, configuration, services, SSH settings, authentication, or firewall rules. Every command must have a timeout. Do not repeat an unchanged command. Respond with exactly one JSON object per turn: {"thought":"short user-facing progress","action":"run","commands":[{"cmd":"timeout 30 <read-only command>","desc":"purpose"}]} or, only after the requested behavior is verified, {"thought":"verified","action":"done","message":"Completed.\\n\\nFindings:\\n...\\n\\nVerification:\\n..."}. A command completing is not the task completing; continue until all parts of the request are checked. Keep output concise and never expose internal notes.`;
+      var xd_finalSysPrompt = xd_readOnlyTask ? xd_compactServerPrompt : (xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt);
       // ─────────────────────────────────────────────────────────────────────
       const aiMessages = [
         { role: "system", content: xd_finalSysPrompt },
