@@ -112240,6 +112240,16 @@ function trackFileWrites(cmd, task) {
   }
 }
 var chatTaskStore = /* @__PURE__ */ new Map();
+function conciseConversationTitle(value) {
+  const clean = String(value || "New chat").replace(/[`*_#>\[\]()]/g, " ").replace(/\s+/g, " ").trim();
+  const domain = clean.match(/(?:on\s+)?([a-z0-9-]+)\.(?:com|site|online|net|org|io|co)\b/i)?.[1];
+  const name = domain ? domain.charAt(0).toUpperCase() + domain.slice(1) : "";
+  if (domain && /invite|referral|refer/i.test(clean)) return `${name} referral promo`;
+  if (domain && /cron|schedule/i.test(clean)) return `Fix ${name} cron`;
+  if (domain && /deploy/i.test(clean)) return `Deploy ${name}`;
+  const short = clean.replace(/^(?:please\s+)?(?:on\s+)?/i, "").slice(0, 56).trim();
+  return short || "New chat";
+}
 // ── Persistent conversation + run tables ────────────────────────────────────
 pool.query(`CREATE TABLE IF NOT EXISTS agent_conversations (
   id SERIAL PRIMARY KEY,
@@ -112275,6 +112285,9 @@ pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS conversatio
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS final_response TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS steps TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS client_message_id TEXT`).catch(()=>{});
+pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_client_unique ON conversation_messages(conversation_id,client_message_id) WHERE client_message_id IS NOT NULL`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS agent_message_idempotency (conversation_id TEXT NOT NULL,user_id INTEGER NOT NULL,server_id INTEGER NOT NULL,client_message_id TEXT NOT NULL,run_id TEXT,task_id TEXT,created_at TIMESTAMP DEFAULT NOW(),PRIMARY KEY(conversation_id,client_message_id))`).catch(()=>{});
 pool.query(`CREATE INDEX IF NOT EXISTS conversations_server_last_idx ON conversations(server_id,last_message_at DESC)`).catch(()=>{});
 setInterval(() => {
   const cutoff = Date.now() - 4 * 60 * 60 * 1e3;
@@ -115478,7 +115491,8 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
       // allow large ZIP deploy messages (up to ~200K chars)
     })).min(1).max(100),
     mode: external_exports.enum(["economy", "balanced", "high-power", "kimi", "v4pro", "grok", "grok-build", "auto"]).default("high-power"),
-    conversationId: external_exports.string().optional()
+    conversationId: external_exports.string().optional(),
+    clientMessageId: external_exports.string().max(100).optional()
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
@@ -115517,9 +115531,20 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
     if (bound.rowCount && (Number(bound.rows[0].user_id) !== Number(res.locals["userId"]) || Number(bound.rows[0].server_id) !== Number(s2.id))) return res.status(404).json({ error: "Conversation not found" });
     const legacyBound = await pool.query("SELECT user_id,server_id FROM agent_conversations WHERE conversation_id=$1", [conversationId]);
     if (legacyBound.rowCount && (Number(legacyBound.rows[0].user_id) !== Number(res.locals["userId"]) || Number(legacyBound.rows[0].server_id) !== Number(s2.id))) return res.status(404).json({ error: "Conversation not found" });
+    if (parsed.data.clientMessageId && bound.rowCount) {
+      const duplicate = await pool.query("SELECT m.public_id message_id,r.public_id run_id,r.metadata->>'legacyTaskId' task_id FROM conversation_messages m LEFT JOIN coding_agent_runs r ON r.id=m.run_id WHERE m.conversation_id=(SELECT id FROM conversations WHERE public_id=$1) AND m.client_message_id=$2 LIMIT 1", [conversationId, parsed.data.clientMessageId]);
+      if (duplicate.rowCount) return res.json({ conversationId, runId: duplicate.rows[0].run_id, taskId: duplicate.rows[0].task_id, duplicate: true });
+    }
     if (bound.rowCount && parsed.data.messages.length === 1) {
       const history = await pool.query("SELECT role,content FROM conversation_messages WHERE conversation_id=(SELECT id FROM conversations WHERE public_id=$1) AND role IN ('user','assistant') ORDER BY sequence DESC LIMIT 12", [conversationId]);
       parsed.data.messages = [...history.rows.reverse().map((m) => ({ role: m.role, content: String(m.content).slice(0, 6000) })), parsed.data.messages[0]];
+    }
+    if (parsed.data.clientMessageId) {
+      const reserved = await pool.query("INSERT INTO agent_message_idempotency(conversation_id,user_id,server_id,client_message_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING client_message_id", [conversationId, res.locals["userId"], s2.id, parsed.data.clientMessageId]);
+      if (!reserved.rowCount) {
+        const prior = await pool.query("SELECT run_id,task_id FROM agent_message_idempotency WHERE conversation_id=$1 AND client_message_id=$2 AND user_id=$3 AND server_id=$4", [conversationId, parsed.data.clientMessageId, res.locals["userId"], s2.id]);
+        return res.json({ conversationId, runId: prior.rows[0]?.run_id, taskId: prior.rows[0]?.task_id, duplicate: true });
+      }
     }
   }
   // ── CHAT CONTROLLER INTERCEPT ────────────────────────────────────────────
@@ -115605,6 +115630,7 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
   };
   task.runId = runId;
   task.conversationId = conversationId;
+  if (parsed.data.clientMessageId) pool.query("UPDATE agent_message_idempotency SET run_id=$1,task_id=$2 WHERE conversation_id=$3 AND client_message_id=$4", [runId, taskId, conversationId, parsed.data.clientMessageId]).catch(()=>{});
   chatTaskStore.set(taskId, task);
   // Persist conversation + run to DB
   pool.query(
@@ -115618,7 +115644,8 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
     [runId, conversationId, s2.id, s2.userId ?? null, task.input, taskId]
   ).catch(() => {});
   await bridgeServerAgentRunStart(task, s2, task.input).catch((error) => req.log?.error({ error }, "Failed to create durable server-agent run"));
-  pool.query("UPDATE conversations SET title=CASE WHEN title IN ('New chat','New conversation') THEN LEFT($2,80) ELSE title END,last_message_at=NOW(),updated_at=NOW() WHERE public_id=$1 AND user_id=$3 AND server_id=$4", [conversationId, task.input, s2.userId, s2.id]).catch(()=>{});
+  if (parsed.data.clientMessageId && task.durableRunDbId) pool.query("UPDATE conversation_messages SET client_message_id=$1 WHERE run_id=$2 AND role='user'", [parsed.data.clientMessageId, task.durableRunDbId]).catch(()=>{});
+  pool.query("UPDATE conversations SET title=CASE WHEN title IN ('New chat','New conversation') THEN $2 ELSE title END,last_message_at=NOW(),updated_at=NOW() WHERE public_id=$1 AND user_id=$3 AND server_id=$4", [conversationId, conciseConversationTitle(task.input), s2.userId, s2.id]).catch(()=>{});
   const send2 = (type, payload) => { if (type === "think" && payload && payload.text) { const _t = payload.text; if (_t.includes("Watchdog") || _t.includes("Format error") || _t.includes("Repeated failures") || _t.includes("recovery agent") || _t.includes("subagent for JSON") || _t.includes("JSON retry") || _t.includes("Context trimmed") || _t.includes("Builder timeout") || _t.includes("UI build agent timeout") || _t.includes("Large file (") || _t.includes("Reconnecting to agent")) return; } return chatTaskEmit(task, type, payload); };
   res.json({ taskId, runId, conversationId });
   // Emit run lifecycle start event
@@ -118054,6 +118081,12 @@ For each failure:
             aiMessages.push({ role: "user", content: fullReport });
           }
         } else if (action.action === "reply") {
+          const replyText = String(action.message ?? "");
+          if (/\bPATH\s+[ABC]\b|queue is not relevant|state\.json|internal orchestration/i.test(replyText)) {
+            send2("step", { text: "Preparing the final response." });
+            aiMessages.push({ role: "assistant", content: raw }, { role: "user", content: "That response contains internal orchestration details. Do not expose PATH labels, queue mechanics, or state.json. Continue the actual work if required, otherwise return action=done with a concise human-readable result and verification." });
+            continue;
+          }
 
           // \u2500 Save verified experience to memory \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
           try {
@@ -119073,7 +119106,7 @@ router8.get("/:id/conversations", requireAuth, async (req, res) => {
     (SELECT status FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_run_status,
     (SELECT GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(r.completed_at,NOW())-r.started_at))*1000)::bigint FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_duration_ms
     FROM conversations c WHERE c.server_id=$1 AND c.user_id=$2${searchSql} ORDER BY c.last_message_at DESC LIMIT $${values.length-1} OFFSET $${values.length}`, values);
-  res.json({ server: { id: serverId, name: owned.rows[0].name }, items: rows.rows, limit, offset, hasMore: rows.rowCount === limit });
+  res.json({ server: { id: serverId, name: owned.rows[0].name }, items: rows.rows.map((row) => ({ ...row, title: conciseConversationTitle(row.title) })), limit, offset, hasMore: rows.rowCount === limit });
 });
 router8.post("/:id/conversations", requireAuth, async (req, res) => {
   const userId = res.locals["userId"], serverId = parseInt(req.params.id);
@@ -119088,13 +119121,17 @@ router8.get("/:id/conversations/:conversationId", requireAuth, async (req, res) 
   const userId = res.locals["userId"], serverId = parseInt(req.params.id), limit = Math.max(1, Math.min(100, Number(req.query.limit) || 50)), before = Math.max(1, Math.min(2147483647, Number(req.query.before) || 2147483647));
   const c = await pool.query("SELECT c.*,s.name server_name,s.host,s.port,s.username FROM conversations c JOIN servers s ON s.id=c.server_id WHERE c.public_id=$1 AND c.server_id=$2 AND c.user_id=$3 AND s.user_id=$3", [req.params.conversationId, serverId, userId]);
   if (!c.rowCount) return res.status(404).json({ error: "Conversation not found" });
-  const messages = await pool.query("SELECT public_id,role,content,sequence,run_id,created_at,token_usage,credit_usage,metadata FROM conversation_messages WHERE conversation_id=$1 AND sequence<$2 ORDER BY sequence DESC LIMIT $3", [c.rows[0].id, before, limit]);
-  const runs = await pool.query(`SELECT public_id run_id,status,phase,started_at,completed_at,heartbeat_at,error,metadata,
+  const messages = await pool.query("SELECT id message_db_id,public_id,role,content,content_type,sequence,run_id,client_message_id,created_at,token_usage,credit_usage,metadata FROM conversation_messages WHERE conversation_id=$1 AND sequence<$2 ORDER BY sequence DESC LIMIT $3", [c.rows[0].id, before, limit]);
+  const runs = await pool.query(`SELECT r.public_id run_id,r.status,r.phase,r.started_at,r.completed_at,r.heartbeat_at,r.error,r.metadata,
+    NULLIF(r.metadata->>'sourceMessageId','')::bigint trigger_message_id,
+    (SELECT m.public_id FROM conversation_messages m WHERE m.run_id=r.id AND m.role='assistant' ORDER BY sequence DESC LIMIT 1) final_response_message_id,
+    (SELECT COUNT(*)::int FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id AND i.status='completed') completed_tasks,
+    (SELECT COUNT(*)::int FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id) total_tasks,
     GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(completed_at,NOW())-started_at))*1000)::bigint duration_ms,
     COALESCE((SELECT SUM(charged_credits) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0) credits_used
     FROM coding_agent_runs r WHERE conversation_id=$1 ORDER BY id DESC LIMIT 25`, [c.rows[0].id]);
   const { id: _id, user_id: _uid, ...safe } = c.rows[0];
-  res.json({ ...safe, canonicalUrl: `/servers/${serverId}/chats/${req.params.conversationId}`, messages: messages.rows.reverse(), hasMoreMessages: messages.rowCount === limit, runs: runs.rows });
+  res.json({ ...safe, title: conciseConversationTitle(safe.title), canonicalUrl: `/servers/${serverId}/chats/${req.params.conversationId}`, messages: messages.rows.reverse(), hasMoreMessages: messages.rowCount === limit, runs: runs.rows });
 });
 router8.get("/:id/conversations/:conversationId/runs/:runId/activity", requireAuth, async (req, res) => {
   const owned = await pool.query("SELECT r.id FROM coding_agent_runs r JOIN conversations c ON c.id=r.conversation_id JOIN servers s ON s.id=c.server_id WHERE r.public_id=$1 AND c.public_id=$2 AND c.server_id=$3 AND c.user_id=$4 AND s.user_id=$4", [req.params.runId, req.params.conversationId, parseInt(req.params.id), res.locals["userId"]]);

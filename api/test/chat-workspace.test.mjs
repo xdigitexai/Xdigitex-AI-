@@ -14,6 +14,9 @@ test("canonical chat URL boots the persistent workspace", () => {
 test("workspace supports history, new chat, follow-up, and lazy activity", () => {
   assert.match(workspace, /Search conversations/);
   assert.match(workspace, /\+ New Chat/);
-  assert.match(workspace, /messages: \[\{ role: "user", content \}\]/);
+  assert.match(workspace, /messages:\[\{role:"user",content\}\]/);
   assert.match(workspace, /\/activity/);
+  assert.match(workspace, /trigger_message_id/);
+  assert.match(workspace, /PATH\\s\+\[ABC\]/);
+  assert.doesNotMatch(workspace, /completed · completed/);
 });

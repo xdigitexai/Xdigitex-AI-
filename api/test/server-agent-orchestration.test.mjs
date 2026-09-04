@@ -52,3 +52,10 @@ test("canonical server chat routes validate user and server ownership", () => {
   assert.match(source, /canonicalUrl: `\/servers\/\$\{serverId\}\/chats\//);
   assert.match(source, /Math\.min\(2147483647/);
 });
+
+test("message idempotency and final-response hygiene protect chat UX", () => {
+  assert.match(source, /agent_message_idempotency/);
+  assert.match(source, /clientMessageId/);
+  assert.match(source, /Preparing the final response/);
+  assert.match(source, /conciseConversationTitle/);
+});
