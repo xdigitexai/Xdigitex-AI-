@@ -116962,6 +116962,7 @@ DO NOT repeat these commands again.`;
               code: -1
             }));
             send2("cmd_done", { index: ci, code: result.code });
+            if (result.code !== 0) task.hadCommandFailure = true;
             const rawOut = [
               result.stdout.trim(),
               result.stderr.trim() ? `[stderr] ${result.stderr.trim()}` : ""
@@ -118009,6 +118010,10 @@ For each failure:
           const userTask = (parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "").toLowerCase();
           const doneMsg = action.message ?? "";
           const doneMsgLower = doneMsg.toLowerCase();
+          if (task.hadCommandFailure && !/status:\s*verified/i.test(doneMsgLower)) {
+            task.status = "partially_completed";
+            action.message = `Partially completed.\n\n${doneMsg || "Some requested checks could not be completed."}\n\nVerification that could not be completed:\nOne or more server commands failed. Review the expandable execution log for details.`;
+          }
           const isSingleFileCheckpoint = isAuto && (currentRole === "builder" || currentRole === "ui_builder") && /^BUILT:\s*\S+/i.test(doneMsg.trim());
           if (isSingleFileCheckpoint) {
             const builtFile = doneMsg.trim().replace(/^BUILT:\s*/i, "").split(/[\s,]/)[0] ?? "file";
