@@ -50,4 +50,5 @@ test("canonical server chat routes validate user and server ownership", () => {
   assert.match(source, /\/:id\/conversations\/:conversationId/);
   assert.match(source, /c\.server_id=\$2 AND c\.user_id=\$3/);
   assert.match(source, /canonicalUrl: `\/servers\/\$\{serverId\}\/chats\//);
+  assert.match(source, /Math\.min\(2147483647/);
 });

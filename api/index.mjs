@@ -119085,7 +119085,7 @@ router8.post("/:id/conversations", requireAuth, async (req, res) => {
   res.status(201).json({ ...row.rows[0], canonicalUrl: `/servers/${serverId}/chats/${publicId}` });
 });
 router8.get("/:id/conversations/:conversationId", requireAuth, async (req, res) => {
-  const userId = res.locals["userId"], serverId = parseInt(req.params.id), limit = Math.max(1, Math.min(100, Number(req.query.limit) || 50)), before = Number(req.query.before) || Number.MAX_SAFE_INTEGER;
+  const userId = res.locals["userId"], serverId = parseInt(req.params.id), limit = Math.max(1, Math.min(100, Number(req.query.limit) || 50)), before = Math.max(1, Math.min(2147483647, Number(req.query.before) || 2147483647));
   const c = await pool.query("SELECT c.*,s.name server_name,s.host,s.port,s.username FROM conversations c JOIN servers s ON s.id=c.server_id WHERE c.public_id=$1 AND c.server_id=$2 AND c.user_id=$3 AND s.user_id=$3", [req.params.conversationId, serverId, userId]);
   if (!c.rowCount) return res.status(404).json({ error: "Conversation not found" });
   const messages = await pool.query("SELECT public_id,role,content,sequence,run_id,created_at,token_usage,credit_usage,metadata FROM conversation_messages WHERE conversation_id=$1 AND sequence<$2 ORDER BY sequence DESC LIMIT $3", [c.rows[0].id, before, limit]);
