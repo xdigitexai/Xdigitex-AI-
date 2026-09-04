@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import { deploymentMigrations, LoopDetector, parseInfrastructureRequest } from "./deployment-runtime.mjs";
 
 export const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "insufficient_credits"]);
 export const RUN_TRANSITIONS = Object.freeze({
@@ -110,6 +111,7 @@ export const migrations = [
 `CREATE TABLE IF NOT EXISTS agent_context_summaries (id BIGSERIAL PRIMARY KEY, conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, through_sequence INTEGER NOT NULL, summary TEXT NOT NULL, metadata JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
 `CREATE TABLE IF NOT EXISTS agent_usage_ledger (id BIGSERIAL PRIMARY KEY, public_id TEXT UNIQUE NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id), conversation_id BIGINT REFERENCES conversations(id), run_id BIGINT REFERENCES coding_agent_runs(id), provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0, provider_cost NUMERIC(14,8) NOT NULL DEFAULT 0, charged_credits NUMERIC(14,6) NOT NULL DEFAULT 0, reserved_credits NUMERIC(14,6) NOT NULL DEFAULT 0, balance_before NUMERIC(14,6) NOT NULL, balance_after NUMERIC(14,6) NOT NULL, status TEXT NOT NULL, provider_request_id TEXT, idempotency_key TEXT UNIQUE NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
 `CREATE TABLE IF NOT EXISTS project_agent_memory (id BIGSERIAL PRIMARY KEY, project_id INTEGER UNIQUE NOT NULL REFERENCES projects(id) ON DELETE CASCADE, stack JSONB NOT NULL DEFAULT '[]', commands JSONB NOT NULL DEFAULT '{}', directories JSONB NOT NULL DEFAULT '[]', environments JSONB NOT NULL DEFAULT '[]', deployment JSONB NOT NULL DEFAULT '{}', repository_index JSONB NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+...deploymentMigrations,
 ];
 
 export class RuntimeStore {
@@ -152,6 +154,9 @@ export class DurableAgentWorker {
       const data = await this.pool.query(`SELECT c.*,m.content request FROM conversations c JOIN conversation_messages m ON m.id=(SELECT id FROM conversation_messages WHERE conversation_id=c.id AND role='user' ORDER BY sequence DESC LIMIT 1) WHERE c.id=$1 AND c.user_id=$2`, [run.conversation_id, run.user_id]);
       if (!data.rowCount) throw new Error("Conversation or request is unavailable");
       const request = data.rows[0].request, kind = inferTaskKind(request), steps = defaultPlan(request);
+      const infrastructure = parseInfrastructureRequest(request);
+      if (infrastructure.action === "deployment" && (!data.rows[0].server_id || !infrastructure.projectPath || !infrastructure.domain)) throw new Error("Deployment requires an exact server, absolute project path, and fully-qualified domain");
+      const loopDetector = new LoopDetector();
       let task = (await this.pool.query("SELECT * FROM agent_tasks WHERE run_id=$1 ORDER BY id DESC LIMIT 1", [run.id])).rows[0];
       if (!task) { task = (await this.pool.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,acceptance_criteria) VALUES($1,$2,$3,$4,$5) RETURNING *`, [randomUUID(), run.conversation_id, run.id, request, JSON.stringify(steps.map((title) => ({ title, required: true })))] )).rows[0]; for (let i = 0; i < steps.length; i++) await this.pool.query("INSERT INTO agent_task_items(task_id,position,title) VALUES($1,$2,$3)", [task.id, i + 1, steps[i]]); await this.store.emit(run.id, "todo.created", { taskId: task.public_id, items: steps }); }
       const history = (await this.pool.query(`SELECT role,content FROM conversation_messages WHERE conversation_id=$1 ORDER BY sequence DESC LIMIT 24`, [run.conversation_id])).rows.reverse();
@@ -190,9 +195,12 @@ export class DurableAgentWorker {
             await this.store.emit(run.id, "tool.started", { toolCallId: tc.public_id, name: tc.name, input, risk: classification.risk });
             if (classification.alwaysRequireApproval) { const approval = (await this.pool.query(`INSERT INTO agent_approvals(public_id,tool_call_id,user_id,original_input) VALUES($1,$2,$3,$4) RETURNING *`, [randomUUID(), tc.id, run.user_id, JSON.stringify(redactSecrets(input))])).rows[0]; await this.store.emit(run.id, "run.waiting", { reason: "approval", approvalId: approval.public_id, toolCallId: tc.public_id }); await this.checkpoint(run.id, "waiting_approval", { iteration, taskId: task.public_id }); await this.store.transition(run.id, "running", "waiting", { phase: "approval" }); return; }
             const result = await this.tools.execute(tc.name, input, { signal: controller.signal, run }); usedTool = true;
+            const loop = loopDetector.record({ tool: tc.name, input, error: result.success ? null : result.stderr, target: infrastructure }, { newInformation: result.success && Boolean(result.stdout), errorChanged: !result.success });
+            await this.pool.query("INSERT INTO agent_run_iterations(run_id,iteration,fingerprint,progress,strategy) VALUES($1,$2,$3,$4,$5) ON CONFLICT(run_id,iteration) DO UPDATE SET fingerprint=$3,progress=$4,strategy=$5", [run.id, iteration, loop.fingerprint, JSON.stringify(loop), loop.strategyChangeRequired ? "change_strategy" : "continue"]);
             await this.pool.query("UPDATE agent_tool_calls SET status=$2,result=$3,duration_ms=$4,completed_at=NOW() WHERE id=$1", [tc.id, result.status, JSON.stringify(result), result.durationMs]);
             await this.store.emit(run.id, result.success ? "tool.completed" : "tool.failed", { toolCallId: tc.public_id, name: tc.name, result });
             messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+            if (!loop.retryAllowed) messages.push({ role: "system", content: "Loop guard: do not repeat this action. Change strategy and inspect a different source of evidence." });
           }
           await this.pool.query("UPDATE agent_task_items SET status='completed',evidence=$2,updated_at=NOW() WHERE task_id=$1 AND position=1", [task.id, JSON.stringify({ toolExecution: true })]);
           await this.store.emit(run.id, "todo.updated", { position: 1, status: "completed" });

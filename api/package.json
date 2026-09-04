@@ -5,7 +5,7 @@
   "main": "index.mjs",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --check index.mjs && node --check agent-runtime.mjs"
+    "check": "node --check index.mjs && node --check agent-runtime.mjs && node --check deployment-runtime.mjs"
   },
   "dependencies": {
     "nodemailer": "^8.0.11",
