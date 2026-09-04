@@ -125,3 +125,17 @@ export const projectMemoryTable = pgTable("project_agent_memory", {
   environments: jsonb("environments").notNull().default([]), deployment: jsonb("deployment").notNull().default({}), repositoryIndex: jsonb("repository_index").notNull().default({}),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+export const scopedAgentMemoryTable = pgTable("agent_scoped_memory", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => usersTable.id, { onDelete: "cascade" }),
+  scopeType: text("scope_type").notNull(),
+  scopeId: text("scope_id").notNull(),
+  key: text("key").notNull(),
+  value: jsonb("value").notNull(),
+  source: text("source").notNull(),
+  confidence: numeric("confidence", { precision: 4, scale: 3 }).notNull().default("1"),
+  lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }).defaultNow().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [uniqueIndex("agent_scoped_memory_scope_uidx").on(t.userId, t.scopeType, t.scopeId, t.key)]);

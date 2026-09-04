@@ -112261,11 +112261,29 @@ pool.query(`CREATE TABLE IF NOT EXISTS agent_runs (
   task_id VARCHAR(80)
 )`).catch(e => console.error('[agent_runs] table init:', e.message));
 pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT NOW()`).catch(()=>{});
+pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP`).catch(()=>{});
+pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP DEFAULT NOW()`).catch(()=>{});
+pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS current_step TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMP`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS credits_used INTEGER NOT NULL DEFAULT 0`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS run_id TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS conversation_id TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS final_response TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS steps TEXT`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS agent_scoped_memory (
+  id BIGSERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  scope_type TEXT NOT NULL CHECK(scope_type IN ('user','server','project','conversation')),
+  scope_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value JSONB NOT NULL,
+  source TEXT NOT NULL,
+  confidence NUMERIC(4,3) NOT NULL DEFAULT 1,
+  last_verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(user_id,scope_type,scope_id,key)
+)`).catch(e => console.error('[agent_memory] table init:', e.message));
 setInterval(() => {
   const cutoff = Date.now() - 4 * 60 * 60 * 1e3;
   for (const [id, task] of chatTaskStore) {
@@ -112288,6 +112306,10 @@ function chatTaskEmit(task, type, payload) {
     ).catch(() => {});
   }
   if (task && type !== "heartbeat") task.lastEmitAt = Date.now();
+  if (task?.runId && type !== "heartbeat") {
+    const currentStep = ["think", "step", "task_start", "status"].includes(type) ? String(payload?.text ?? payload?.task ?? payload?.value ?? "").slice(0, 300) : null;
+    pool.query("UPDATE agent_runs SET heartbeat_at=NOW(),current_step=COALESCE($2,current_step) WHERE run_id=$1", [task.runId, currentStep]).catch(() => {});
+  }
   for (const sub of [...task.subscribers]) {
     try {
       sub(type, payload);
@@ -112345,6 +112367,11 @@ async function settleServerAgentCredits(task, ledger, usage, provider, model) {
     return row.rows[0];
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 }
+async function rememberAgentFact({ userId, scopeType, scopeId, key, value, source, confidence = 1 }) {
+  const serialized = JSON.stringify(value);
+  if (/(password|private.?key|api.?key|secret|bearer|credit.?card)/i.test(`${key} ${serialized}`)) return;
+  await pool.query(`INSERT INTO agent_scoped_memory(user_id,scope_type,scope_id,key,value,source,confidence,last_verified_at) VALUES($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT(user_id,scope_type,scope_id,key) DO UPDATE SET value=EXCLUDED.value,source=EXCLUDED.source,confidence=EXCLUDED.confidence,last_verified_at=NOW(),updated_at=NOW()`, [userId, scopeType, String(scopeId), key, serialized, source, confidence]);
+}
 async function bridgeServerAgentRunStart(task, server, prompt) {
   if (!task.userId) return;
   const client = await pool.connect();
@@ -112368,6 +112395,10 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
     task.durableTaskDbId = plan.rows[0].id;
     for (const [position, title] of ["Inspect server state", "Perform requested work", "Verify result", "Deliver final report"].entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status) VALUES($1,$2,$3,$4)", [task.durableTaskDbId, position + 1, title, position === 0 ? "in_progress" : "pending"]);
     await client.query("COMMIT");
+    await Promise.all([
+      rememberAgentFact({ userId: task.userId, scopeType: "user", scopeId: task.userId, key: "operating_preferences", value: { preferFreePorts: true, preserveSshConfiguration: true, restartOnlyTargetProcess: true, verifyBeforeCompletion: true, exactDomainIsolation: true, targetedFileReading: true }, source: "system_policy", confidence: 1 }),
+      rememberAgentFact({ userId: task.userId, scopeType: "server", scopeId: server.id, key: "identity", value: { serverId: server.id, name: server.name, host: server.host, port: server.port, username: server.username, credentialRef: `server_${server.id}` }, source: "connected_server_record", confidence: 1 })
+    ]);
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 }
 async function bridgeServerAgentRunFinish(task) {
@@ -112493,7 +112524,7 @@ var serverUpdate = external_exports.object({
   status: external_exports.string().optional()
 });
 var CMD_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes max per command — prevents 45-min hangs
-function sshExec(host, port2, username, authType, privateKey, password, command = "echo connected", onData, cmdTimeoutMs) {
+function sshExec(host, port2, username, authType, privateKey, password, command = "echo connected", onData, cmdTimeoutMs, abortSignal) {
   const effectiveCmdTimeout = cmdTimeoutMs ?? CMD_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
     const client = new Client2();
@@ -112501,8 +112532,13 @@ function sshExec(host, port2, username, authType, privateKey, password, command 
     let stderr = "";
     let _cmdTimer = null;
     let _resolved = false;
-    const safeResolve = (val) => { if (!_resolved) { _resolved = true; if (_cmdTimer) clearTimeout(_cmdTimer); resolve(val); } };
-    const safeReject  = (err) => { if (!_resolved) { _resolved = true; if (_cmdTimer) clearTimeout(_cmdTimer); reject(err); } };
+    let activeStream = null;
+    const cleanupAbort = () => abortSignal?.removeEventListener("abort", onAbort);
+    const safeResolve = (val) => { if (!_resolved) { _resolved = true; if (_cmdTimer) clearTimeout(_cmdTimer); cleanupAbort(); resolve(val); } };
+    const safeReject  = (err) => { if (!_resolved) { _resolved = true; if (_cmdTimer) clearTimeout(_cmdTimer); cleanupAbort(); reject(err); } };
+    const onAbort = () => { try { activeStream?.destroy(); } catch {} try { client.end(); } catch {} safeResolve({ stdout, stderr: `${stderr}\n[CANCELLED] Stopped by user.`, code: 130 }); };
+    if (abortSignal?.aborted) return onAbort();
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
     client.on("ready", () => {
       const normalizedCommand = command.replace(/\\n/g, "\n");
       client.exec(normalizedCommand, (err, stream) => {
@@ -115574,7 +115610,7 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
     [conversationId, s2.id, s2.userId ?? null, runId]
   ).catch(() => {});
   pool.query(
-    `INSERT INTO agent_runs(run_id,conversation_id,server_id,user_id,status,phase,input,task_id) VALUES($1,$2,$3,$4,'running','planning',$5,$6)
+    `INSERT INTO agent_runs(run_id,conversation_id,server_id,user_id,status,phase,input,task_id,started_at,heartbeat_at,current_step) VALUES($1,$2,$3,$4,'running','planning',$5,$6,NOW(),NOW(),'Planning task')
      ON CONFLICT(run_id) DO NOTHING`,
     [runId, conversationId, s2.id, s2.userId ?? null, task.input, taskId]
   ).catch(() => {});
@@ -116729,6 +116765,7 @@ After fixing, verify the file works, then action="done".`
           send2("run_blocked", { runId: task.runId, conversationId: task.conversationId, status: "blocked", reason: "Insufficient credits" });
           break;
         }
+        activeStream = stream;
         const completion = await callWithRetry();
         await settleServerAgentCredits(task, creditLedger, completion.usage, iterProvider, iterModel);
         if (completion.usage) {
@@ -116955,7 +116992,9 @@ DO NOT repeat these commands again.`;
               s2.privateKey,
               s2.password,
               cmd,
-              (chunk) => send2("cmd_output", { index: ci, chunk })
+              (chunk) => send2("cmd_output", { index: ci, chunk }),
+              void 0,
+              task.abort.signal
             ).catch((e2) => ({
               stdout: "",
               stderr: String(e2 instanceof Error ? e2.message : e2),
@@ -118277,7 +118316,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
         chatTaskEmit(task, _runEvt, { runId: task.runId, conversationId: task.conversationId, status: task.status });
         if (task.runId) {
           pool.query(
-            `UPDATE agent_runs SET status=$1, phase=$2, completed_at=NOW() WHERE run_id=$3`,
+            `UPDATE agent_runs SET status=$1,phase=$2,completed_at=NOW(),finished_at=NOW(),heartbeat_at=NOW(),current_step=$2 WHERE run_id=$3`,
             [task.status, task.status, task.runId]
           ).catch(() => {});
           pool.query(
@@ -118315,12 +118354,18 @@ router8.get("/:id/tasks", requireAuth, async (req, res) => {
   })).sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
   return res.json(tasks);
 });
+router8.get("/:id/agent-context", requireAuth, async (req, res) => {
+  const serverId = parseInt(req.params["id"] ?? "0"), userId = res.locals["userId"];
+  const owned = await pool.query("SELECT id,name,host,port,username FROM servers WHERE id=$1 AND user_id=$2", [serverId, userId]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Not found" });
+  const result = await pool.query(`SELECT run_id,conversation_id,task_id,status,phase,input,started_at,finished_at,completed_at,heartbeat_at,current_step,cancel_requested_at,CASE WHEN COALESCE(finished_at,completed_at) IS NOT NULL THEN EXTRACT(EPOCH FROM (COALESCE(finished_at,completed_at)-started_at))*1000 ELSE EXTRACT(EPOCH FROM (NOW()-started_at))*1000 END AS elapsed_ms FROM agent_runs WHERE server_id=$1 AND user_id=$2 ORDER BY started_at DESC NULLS LAST,id DESC LIMIT 1`, [serverId, userId]);
+  return res.json({ server: owned.rows[0], run: result.rows[0] ?? null });
+});
 router8.get("/:id/runs/:runId", requireAuth, async (req, res) => {
   try {
     const _r = await pool.query(
-      `SELECT run_id, conversation_id, status, phase, completed_at
-       FROM agent_runs WHERE run_id=$1 AND server_id=$2 LIMIT 1`,
-      [req.params["runId"], parseInt(req.params["id"] ?? "0")]
+      `SELECT run_id,conversation_id,status,phase,started_at,finished_at,completed_at,heartbeat_at,current_step,CASE WHEN COALESCE(finished_at,completed_at) IS NOT NULL THEN EXTRACT(EPOCH FROM (COALESCE(finished_at,completed_at)-started_at))*1000 ELSE EXTRACT(EPOCH FROM (NOW()-started_at))*1000 END AS elapsed_ms FROM agent_runs WHERE run_id=$1 AND server_id=$2 AND user_id=$3 LIMIT 1`,
+      [req.params["runId"], parseInt(req.params["id"] ?? "0"), res.locals["userId"]]
     );
     if (!_r.rows.length) return res.status(404).json({ error: "Run not found" });
     return res.json(_r.rows[0]);
@@ -118427,7 +118472,7 @@ router8.post("/:id/tasks/:taskId/cancel", requireAuth, (req, res) => {
   chatTaskEmit(task, "reply", { text: "Cancelled. Completed work was preserved and this chat is ready for another request." });
   try {
     chatTaskEmit(task, "run_failed", { runId: task.runId, conversationId: task.conversationId, status: "cancelled", reason: "User cancelled" });
-    if (task.runId) pool.query(`UPDATE agent_runs SET status='cancelled', completed_at=NOW() WHERE run_id=$1`, [task.runId]).catch(() => {});
+    if (task.runId) pool.query(`UPDATE agent_runs SET status='cancelled',cancel_requested_at=NOW(),completed_at=NOW(),finished_at=NOW(),heartbeat_at=NOW(),current_step='Stopped by user' WHERE run_id=$1`, [task.runId]).catch(() => {});
   } catch (_ce) {}
   chatTaskEmit(task, "stream_end", {});
   return res.json({ ok: true });
