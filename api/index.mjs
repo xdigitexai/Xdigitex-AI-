@@ -115399,7 +115399,7 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
   const [s2] = await db.select().from(serversTable).where(eq(serversTable.id, parseInt(req.params.id)));
   if (!s2) return res.status(404).json({ error: "Not found" });
-  if (s2.userId && s2.userId !== req.user?.id) return res.status(404).json({ error: "Not found" });
+  if (s2.userId && s2.userId !== res.locals["userId"]) return res.status(404).json({ error: "Not found" });
   if (s2.userId) { const [_chatCr] = await db.select({ credits: usersTable.credits }).from(usersTable).where(eq(usersTable.id, s2.userId)); if (!_chatCr || _chatCr.credits <= 0) return res.status(402).json({ error: "\u26a0\ufe0f No credits remaining \u2014 please top up your account at agent.xdigitex.com to continue.", suspended: true }); }
   if (parsed.data.messages.length === 1) {
     const userMsg = (parsed.data.messages[0]?.content ?? "").toLowerCase();
