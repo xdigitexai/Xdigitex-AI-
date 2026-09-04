@@ -112268,6 +112268,15 @@ setInterval(() => {
 var TIMELINE_TYPES = /* @__PURE__ */ new Set(["think", "ssh", "browse", "step", "reply", "error"]);
 function chatTaskEmit(task, type, payload) {
   task.eventBuffer.push({ type, payload });
+  if (type === "reply" && payload?.text) task.lastReply = payload.text;
+  if (task?.durableRunDbId) {
+    const eventType = ({ run_started: "run.started", run_completed: "run.completed", run_failed: task.status === "cancelled" ? "run.cancelled" : "run.failed", xd_plan: "task.created", ssh: "tool.output", step: "task.updated", reply: "assistant.progress", error: "tool.failed", stream_end: "stream.end" })[type] ?? `legacy.${type}`;
+    pool.query(
+      `INSERT INTO agent_run_events(run_id,sequence,type,payload)
+       SELECT $1,COALESCE(MAX(sequence),0)+1,$2,$3 FROM agent_run_events WHERE run_id=$1`,
+      [task.durableRunDbId, eventType, JSON.stringify(redactSecrets(payload ?? {}))]
+    ).catch(() => {});
+  }
   if (task && type !== "heartbeat") task.lastEmitAt = Date.now();
   for (const sub of [...task.subscribers]) {
     try {
@@ -112283,6 +112292,48 @@ function chatTaskEmit(task, type, payload) {
       task.lastAction = text2;
     }
   }
+}
+async function bridgeServerAgentRunStart(task, server, prompt) {
+  if (!task.userId) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const conversation = await client.query(
+      `INSERT INTO conversations(public_id,user_id,title,server_id,status,metadata,last_message_at)
+       VALUES($1,$2,$3,$4,'active',$5,NOW())
+       ON CONFLICT(public_id) DO UPDATE SET server_id=EXCLUDED.server_id,last_message_at=NOW(),updated_at=NOW()
+       RETURNING id`,
+      [task.conversationId, task.userId, String(prompt || "Server task").slice(0, 80), server.id, JSON.stringify({ source: "server-agent", serverName: server.name, host: server.host, port: server.port, username: server.username })]
+    );
+    const conversationDbId = conversation.rows[0].id;
+    const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1 FOR UPDATE", [conversationDbId])).rows[0].n;
+    const message = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,role,content,sequence,metadata) VALUES($1,$2,'user',$3,$4,$5) RETURNING id`, [randomUUID2(), conversationDbId, prompt, sequence, JSON.stringify({ source: "server-agent", serverId: server.id })]);
+    const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username })]);
+    task.durableRunDbId = run.rows[0].id; task.durableConversationDbId = conversationDbId;
+    await client.query("UPDATE conversation_messages SET run_id=$2 WHERE id=$1", [message.rows[0].id, task.durableRunDbId]);
+    const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify([{ title: "Inspect server state", required: true }, { title: "Perform requested work", required: true }, { title: "Verify result", required: true }, { title: "Deliver final report", required: true }]), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true })]);
+    task.durableTaskDbId = plan.rows[0].id;
+    for (const [position, title] of ["Inspect server state", "Perform requested work", "Verify result", "Deliver final report"].entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status) VALUES($1,$2,$3,$4)", [task.durableTaskDbId, position + 1, title, position === 0 ? "in_progress" : "pending"]);
+    await client.query("COMMIT");
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+}
+async function bridgeServerAgentRunFinish(task) {
+  if (!task.durableRunDbId) return;
+  const failed = task.status === "failed" || task.status === "error";
+  const cancelled = task.status === "cancelled";
+  const status = cancelled ? "cancelled" : failed ? "failed" : "completed";
+  const finalText = task.lastReply || (cancelled ? "Task cancelled. Completed work was preserved and the conversation remains available." : failed ? "The task failed after recovery attempts. Review the run timeline for the final error." : "Task completed. Review the run timeline for actions and verification evidence.");
+  const client = await pool.connect();
+  try { await client.query("BEGIN");
+    await client.query("UPDATE coding_agent_runs SET status=$2,phase=$2,heartbeat_at=NOW(),completed_at=NOW(),lock_token=NULL,updated_at=NOW(),error=CASE WHEN $2='failed' THEN $3 ELSE error END WHERE id=$1", [task.durableRunDbId, status, failed ? finalText : null]);
+    await client.query("UPDATE agent_tasks SET status=$2,updated_at=NOW() WHERE id=$1", [task.durableTaskDbId, status]);
+    await client.query("UPDATE agent_task_items SET status=CASE WHEN $2='completed' THEN 'completed' WHEN status='in_progress' THEN 'failed' ELSE status END,evidence=CASE WHEN $2='completed' THEN $3 ELSE evidence END,updated_at=NOW() WHERE task_id=$1", [task.durableTaskDbId, status, JSON.stringify({ finalResponseStored: true, filesModified: task.filesModified ?? [] })]);
+    const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1 FOR UPDATE", [task.durableConversationDbId])).rows[0].n;
+    const final = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,run_id,role,content,sequence,metadata) VALUES($1,$2,$3,'assistant',$4,$5,$6) RETURNING id`, [randomUUID2(), task.durableConversationDbId, task.durableRunDbId, finalText, sequence, JSON.stringify({ final: true, status, filesModified: task.filesModified ?? [] })]);
+    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ finalMessageId: final.rows[0].id, actionCount: task.timeline?.length ?? 0, filesModified: task.filesModified ?? [] })]);
+    await client.query("UPDATE conversations SET last_message_at=NOW(),updated_at=NOW() WHERE id=$1", [task.durableConversationDbId]);
+    await client.query("COMMIT");
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 }
 async function generateTaskTitle(task, summary) {
   const CATEGORIES = ["website", "bugfix", "deployment", "security", "vps", "email", "automation", "database", "api", "general"];
@@ -115334,7 +115385,7 @@ After FILE UPLOAD / FORM SAVE:
 10. Done message lists: tested URLs, what was verified, and what could NOT be verified
 11. Done message includes a Prompt Compliance checklist \u2014 [x] per confirmed feature, [ ] per unconfirmed`;
 };
-router8.post("/:id/chat", async (req, res) => {
+router8.post("/:id/chat", requireAuth, async (req, res) => {
   const schema = external_exports.object({
     messages: external_exports.array(external_exports.object({
       role: external_exports.enum(["user", "assistant"]),
@@ -115348,6 +115399,7 @@ router8.post("/:id/chat", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
   const [s2] = await db.select().from(serversTable).where(eq(serversTable.id, parseInt(req.params.id)));
   if (!s2) return res.status(404).json({ error: "Not found" });
+  if (s2.userId && s2.userId !== req.user?.id) return res.status(404).json({ error: "Not found" });
   if (s2.userId) { const [_chatCr] = await db.select({ credits: usersTable.credits }).from(usersTable).where(eq(usersTable.id, s2.userId)); if (!_chatCr || _chatCr.credits <= 0) return res.status(402).json({ error: "\u26a0\ufe0f No credits remaining \u2014 please top up your account at agent.xdigitex.com to continue.", suspended: true }); }
   if (parsed.data.messages.length === 1) {
     const userMsg = (parsed.data.messages[0]?.content ?? "").toLowerCase();
@@ -115470,6 +115522,7 @@ router8.post("/:id/chat", async (req, res) => {
      ON CONFLICT(run_id) DO NOTHING`,
     [runId, conversationId, s2.id, s2.userId ?? null, task.input, taskId]
   ).catch(() => {});
+  await bridgeServerAgentRunStart(task, s2, task.input).catch((error) => req.log?.error({ error }, "Failed to create durable server-agent run"));
   const send2 = (type, payload) => { if (type === "think" && payload && payload.text) { const _t = payload.text; if (_t.includes("Watchdog") || _t.includes("Format error") || _t.includes("Repeated failures") || _t.includes("recovery agent") || _t.includes("subagent for JSON") || _t.includes("JSON retry") || _t.includes("Context trimmed") || _t.includes("Builder timeout") || _t.includes("UI build agent timeout") || _t.includes("Large file (") || _t.includes("Reconnecting to agent")) return; } return chatTaskEmit(task, type, payload); };
   res.json({ taskId, runId, conversationId });
   // Emit run lifecycle start event
@@ -118143,6 +118196,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
           ).catch(() => {});
         }
       } catch (_le) {}
+      await bridgeServerAgentRunFinish(task).catch(() => {});
       chatTaskEmit(task, "stream_end", {});
       sshExec(
         s2.host,
@@ -124555,7 +124609,7 @@ router33.use("/v1", v1_meta_default);
 var routes_default = router33;
 
 // src/app.ts
-import { installAgentRuntime, recoverStaleRuns } from "./agent-runtime.mjs";
+import { installAgentRuntime, recoverStaleRuns, redactSecrets } from "./agent-runtime.mjs";
 var app = (0, import_express34.default)();
 app.use(
   (0, import_pino_http.default)({
