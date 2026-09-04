@@ -112274,6 +112274,8 @@ pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS run_id TEXT
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS conversation_id TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS final_response TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS steps TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT`).catch(()=>{});
+pool.query(`CREATE INDEX IF NOT EXISTS conversations_server_last_idx ON conversations(server_id,last_message_at DESC)`).catch(()=>{});
 setInterval(() => {
   const cutoff = Date.now() - 4 * 60 * 60 * 1e3;
   for (const [id, task] of chatTaskStore) {
@@ -115510,6 +115512,16 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
   const conversationId = (parsed.data.conversationId && typeof parsed.data.conversationId === 'string' && parsed.data.conversationId.length > 4)
     ? parsed.data.conversationId
     : ('conv_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36));
+  if (parsed.data.conversationId) {
+    const bound = await pool.query("SELECT user_id,server_id FROM conversations WHERE public_id=$1", [conversationId]);
+    if (bound.rowCount && (Number(bound.rows[0].user_id) !== Number(res.locals["userId"]) || Number(bound.rows[0].server_id) !== Number(s2.id))) return res.status(404).json({ error: "Conversation not found" });
+    const legacyBound = await pool.query("SELECT user_id,server_id FROM agent_conversations WHERE conversation_id=$1", [conversationId]);
+    if (legacyBound.rowCount && (Number(legacyBound.rows[0].user_id) !== Number(res.locals["userId"]) || Number(legacyBound.rows[0].server_id) !== Number(s2.id))) return res.status(404).json({ error: "Conversation not found" });
+    if (bound.rowCount && parsed.data.messages.length === 1) {
+      const history = await pool.query("SELECT role,content FROM conversation_messages WHERE conversation_id=(SELECT id FROM conversations WHERE public_id=$1) AND role IN ('user','assistant') ORDER BY sequence DESC LIMIT 12", [conversationId]);
+      parsed.data.messages = [...history.rows.reverse().map((m) => ({ role: m.role, content: String(m.content).slice(0, 6000) })), parsed.data.messages[0]];
+    }
+  }
   // ── CHAT CONTROLLER INTERCEPT ────────────────────────────────────────────
   // If there is already a running task for this conversation, route the new
   // message into it instead of spawning a second full agent loop.
@@ -115606,6 +115618,7 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
     [runId, conversationId, s2.id, s2.userId ?? null, task.input, taskId]
   ).catch(() => {});
   await bridgeServerAgentRunStart(task, s2, task.input).catch((error) => req.log?.error({ error }, "Failed to create durable server-agent run"));
+  pool.query("UPDATE conversations SET title=CASE WHEN title IN ('New chat','New conversation') THEN LEFT($2,80) ELSE title END,last_message_at=NOW(),updated_at=NOW() WHERE public_id=$1 AND user_id=$3 AND server_id=$4", [conversationId, task.input, s2.userId, s2.id]).catch(()=>{});
   const send2 = (type, payload) => { if (type === "think" && payload && payload.text) { const _t = payload.text; if (_t.includes("Watchdog") || _t.includes("Format error") || _t.includes("Repeated failures") || _t.includes("recovery agent") || _t.includes("subagent for JSON") || _t.includes("JSON retry") || _t.includes("Context trimmed") || _t.includes("Builder timeout") || _t.includes("UI build agent timeout") || _t.includes("Large file (") || _t.includes("Reconnecting to agent")) return; } return chatTaskEmit(task, type, payload); };
   res.json({ taskId, runId, conversationId });
   // Emit run lifecycle start event
@@ -116247,6 +116260,7 @@ Tell the user to check that the agent script is still running in their terminal 
       const commandResultCount = /* @__PURE__ */ new Map();
       const commandResultCache = /* @__PURE__ */ new Map();
       let mutationEpoch = 0;
+      let budgetFinalizationRequested = false;
       const originalUserMessage = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
       const taskComplexity = simpleTaskFastPath ? "simple" : /\b(rebuild|migrate|architecture|entire|full|multiple|complete system)\b/i.test(originalUserMessage) ? "complex" : /\b(deploy|install|implement|redesign|integrate)\b/i.test(originalUserMessage) ? "moderate" : "simple";
       const maxIterations = taskComplexity === "complex" ? 40 : taskComplexity === "moderate" ? 24 : 10;
@@ -116336,9 +116350,14 @@ Tell the user to check that the agent script is still running in their terminal 
       let hasAddedMaxStepsWarning = false;
       for (let iter = 0; iter < maxIterations; iter++) {
         if (totalCommands >= maxCommands) {
-          task.status = "partially_completed";
-          send2("reply", { text: `Partially completed.\n\nThe ${taskComplexity} task reached its ${maxCommands}-command safety budget. Completed work was preserved; review Task History before continuing.` });
-          break;
+          if (!budgetFinalizationRequested) {
+            budgetFinalizationRequested = true;
+            aiMessages.push({ role: "user", content: `[RUN-WIDE COMMAND BUDGET REACHED]\nDo not run more tools or restart planning. Evaluate the authoritative original request against facts already collected. If satisfied, respond action="done" with a concise completed/verified report. Otherwise respond action="done" with STATUS: PARTIALLY VERIFIED and only the genuinely unresolved requirement.` });
+          } else {
+            task.status = "partially_completed";
+            send2("reply", { text: "Partially completed. The run-wide command budget was reached and required work remains. Completed work was preserved." });
+            break;
+          }
         }
         if (aiMessages.length > 14) {
           const recent = aiMessages.slice(-10).map((message) => ({ ...message, content: String(message.content ?? "").slice(0, 6000) }));
@@ -119038,6 +119057,50 @@ router8.get("/:id/sftp-download", requireAuth, async (req, res) => {
   if (s2.authType === "key" && s2.privateKey) connectOpts["privateKey"] = s2.privateKey;
   else if (s2.password) connectOpts["password"] = s2.password;
   client.connect(connectOpts);
+});
+router8.get("/:id/conversations", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], serverId = parseInt(req.params.id), limit = Math.max(1, Math.min(50, Number(req.query.limit) || 25)), offset = Math.max(0, Number(req.query.offset) || 0), search = String(req.query.search || "").trim();
+  const owned = await pool.query("SELECT id,name FROM servers WHERE id=$1 AND user_id=$2", [serverId, userId]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Not found" });
+  const values = [serverId, userId];
+  let searchSql = "";
+  if (search) { values.push(`%${search}%`); searchSql = ` AND (c.title ILIKE $3 OR c.summary ILIKE $3 OR EXISTS(SELECT 1 FROM conversation_messages m WHERE m.conversation_id=c.id AND m.content ILIKE $3))`; }
+  values.push(limit, offset);
+  const rows = await pool.query(`SELECT c.public_id conversation_id,c.title,c.status,c.summary,c.created_at,c.updated_at,c.last_message_at,
+    (SELECT content FROM conversation_messages m WHERE m.conversation_id=c.id ORDER BY sequence DESC LIMIT 1) preview,
+    (SELECT COUNT(*)::int FROM conversation_messages m WHERE m.conversation_id=c.id) message_count,
+    (SELECT COUNT(*)::int FROM coding_agent_runs r WHERE r.conversation_id=c.id) run_count,
+    (SELECT status FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_run_status,
+    (SELECT GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(r.completed_at,NOW())-r.started_at))*1000)::bigint FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_duration_ms
+    FROM conversations c WHERE c.server_id=$1 AND c.user_id=$2${searchSql} ORDER BY c.last_message_at DESC LIMIT $${values.length-1} OFFSET $${values.length}`, values);
+  res.json({ server: { id: serverId, name: owned.rows[0].name }, items: rows.rows, limit, offset, hasMore: rows.rowCount === limit });
+});
+router8.post("/:id/conversations", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], serverId = parseInt(req.params.id);
+  const owned = await pool.query("SELECT id,name FROM servers WHERE id=$1 AND user_id=$2", [serverId, userId]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Not found" });
+  const publicId = `chat_${randomUUID2().replace(/-/g, "")}`;
+  const row = await pool.query("INSERT INTO conversations(public_id,user_id,title,server_id,status,metadata,last_message_at) VALUES($1,$2,'New chat',$3,'active',$4,NOW()) RETURNING public_id conversation_id,title,server_id,created_at", [publicId, userId, serverId, JSON.stringify({ source: "server-agent-chat" })]);
+  await pool.query("INSERT INTO agent_conversations(conversation_id,server_id,user_id,title,status) VALUES($1,$2,$3,'New chat','active') ON CONFLICT(conversation_id) DO NOTHING", [publicId, serverId, userId]);
+  res.status(201).json({ ...row.rows[0], canonicalUrl: `/servers/${serverId}/chats/${publicId}` });
+});
+router8.get("/:id/conversations/:conversationId", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], serverId = parseInt(req.params.id), limit = Math.max(1, Math.min(100, Number(req.query.limit) || 50)), before = Number(req.query.before) || Number.MAX_SAFE_INTEGER;
+  const c = await pool.query("SELECT c.*,s.name server_name,s.host,s.port,s.username FROM conversations c JOIN servers s ON s.id=c.server_id WHERE c.public_id=$1 AND c.server_id=$2 AND c.user_id=$3 AND s.user_id=$3", [req.params.conversationId, serverId, userId]);
+  if (!c.rowCount) return res.status(404).json({ error: "Conversation not found" });
+  const messages = await pool.query("SELECT public_id,role,content,sequence,run_id,created_at,token_usage,credit_usage,metadata FROM conversation_messages WHERE conversation_id=$1 AND sequence<$2 ORDER BY sequence DESC LIMIT $3", [c.rows[0].id, before, limit]);
+  const runs = await pool.query(`SELECT public_id run_id,status,phase,started_at,completed_at,heartbeat_at,error,metadata,
+    GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(completed_at,NOW())-started_at))*1000)::bigint duration_ms,
+    COALESCE((SELECT SUM(charged_credits) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0) credits_used
+    FROM coding_agent_runs r WHERE conversation_id=$1 ORDER BY id DESC LIMIT 25`, [c.rows[0].id]);
+  const { id: _id, user_id: _uid, ...safe } = c.rows[0];
+  res.json({ ...safe, canonicalUrl: `/servers/${serverId}/chats/${req.params.conversationId}`, messages: messages.rows.reverse(), hasMoreMessages: messages.rowCount === limit, runs: runs.rows });
+});
+router8.get("/:id/conversations/:conversationId/runs/:runId/activity", requireAuth, async (req, res) => {
+  const owned = await pool.query("SELECT r.id FROM coding_agent_runs r JOIN conversations c ON c.id=r.conversation_id JOIN servers s ON s.id=c.server_id WHERE r.public_id=$1 AND c.public_id=$2 AND c.server_id=$3 AND c.user_id=$4 AND s.user_id=$4", [req.params.runId, req.params.conversationId, parseInt(req.params.id), res.locals["userId"]]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Run not found" });
+  const [events, tools] = await Promise.all([pool.query("SELECT sequence,type,payload,created_at FROM agent_run_events WHERE run_id=$1 ORDER BY sequence LIMIT 500", [owned.rows[0].id]), pool.query("SELECT public_id,name,status,input,result,duration_ms,started_at,completed_at FROM agent_tool_calls WHERE run_id=$1 ORDER BY id LIMIT 200", [owned.rows[0].id])]);
+  res.json({ events: events.rows, toolCalls: tools.rows });
 });
 router8.get("/:id/history", requireAuth, async (req, res) => {
   const userId = res.locals["userId"];

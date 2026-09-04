@@ -39,3 +39,15 @@ test("read-only command results are cached until a successful mutation", () => {
   assert.match(source, /commandResultCache\.has\(cacheKey\)/);
   assert.match(source, /mutationEpoch\+\+/);
 });
+
+test("budget exhaustion requests completion evaluation before partial status", () => {
+  assert.match(source, /RUN-WIDE COMMAND BUDGET REACHED/);
+  assert.match(source, /If satisfied, respond action="done"/);
+  assert.match(source, /budgetFinalizationRequested/);
+});
+
+test("canonical server chat routes validate user and server ownership", () => {
+  assert.match(source, /\/:id\/conversations\/:conversationId/);
+  assert.match(source, /c\.server_id=\$2 AND c\.user_id=\$3/);
+  assert.match(source, /canonicalUrl: `\/servers\/\$\{serverId\}\/chats\//);
+});

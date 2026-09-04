@@ -84,8 +84,14 @@
   // Also stores runId so we can poll /runs/:runId to recover from stuck "Working..." state.
 
   const store = {
-    getConv: (sid) => sessionStorage.getItem('_xd_conv_' + sid) || null,
-    setConv: (sid, cid) => sessionStorage.setItem('_xd_conv_' + sid, cid),
+    getConv: (sid) => {
+      const match = location.pathname.match(/^\/servers\/(\d+)\/chats\/([A-Za-z0-9_-]+)$/);
+      return match && match[1] === String(sid) ? match[2] : null;
+    },
+    setConv: (sid, cid) => {
+      const canonical = `/servers/${sid}/chats/${cid}`;
+      if (location.pathname !== canonical) history.replaceState({}, '', canonical);
+    },
     getRun:  (sid) => sessionStorage.getItem('_xd_run_' + sid) || null,
     setRun:  (sid, rid) => sessionStorage.setItem('_xd_run_' + sid, rid),
     getTask: (sid) => sessionStorage.getItem('_xd_task_' + sid) || null,
@@ -100,7 +106,6 @@
       taskId: store.getTask(serverId),
     }),
     clearConv: (serverId) => {
-      sessionStorage.removeItem('_xd_conv_' + serverId);
       sessionStorage.removeItem('_xd_run_' + serverId);
       sessionStorage.removeItem('_xd_task_' + serverId);
       console.log('[XD] Conversation cleared for server', serverId);
@@ -195,6 +200,7 @@
 })();
 </script>
 <script defer src="/server-agent-controls.js"></script>
+<script defer src="/chat-workspace.js"></script>
   </head>
   <body>
     <div id="root"></div>
