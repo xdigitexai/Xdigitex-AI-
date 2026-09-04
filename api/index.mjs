@@ -116032,9 +116032,11 @@ void (async () => {
       const isAuto = parsed.data.mode === "auto";
       const browserStatus = await browserProbeResult;
       const userTaskText = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
+      const explicitTargetMatch = userTaskText.match(/(?:^|\s)([a-z0-9.-]+\/[^\s,;]+\.(?:php|html?|css|js|ts|tsx|jsx|py|rb|go|java))(?:\s|,|;|$)/i);
+      const simpleTaskFastPath = !!explicitTargetMatch && /\b(add|change|edit|replace|remove|rename|fix|check)\b/i.test(userTaskText) && !/\b(database|migration|schema|multiple|entire|full system|architecture|rebuild)\b/i.test(userTaskText);
       const [pastExperiences, knowledgeResult] = await Promise.all([
-        searchExperiences(userTaskText, 3, s2.id).catch(() => []),
-        buildKnowledgeBlock(userTaskText).catch(() => ({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }))
+        simpleTaskFastPath ? Promise.resolve([]) : searchExperiences(userTaskText, 3, s2.id).catch(() => []),
+        simpleTaskFastPath ? Promise.resolve({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }) : buildKnowledgeBlock(userTaskText).catch(() => ({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }))
       ]);
       const memoryBlock = formatMemoryBlock(pastExperiences);
       const knowledgeBlock = knowledgeResult.block;
@@ -116090,6 +116092,7 @@ void (async () => {
         { role: "system", content: xd_finalSysPrompt },
         ...parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content }))
       ];
+      if (simpleTaskFastPath) aiMessages.push({ role: "user", content: `[SIMPLE TASK FAST PATH]\nOriginal request (authoritative): ${userTaskText.slice(0, 1200)}\nExact target: ${explicitTargetMatch[1]}\nInspect this exact source file first. If the requested state already exists, do not edit it: run one relevant syntax check, verify the requested meaning, then finish. Otherwise make only the requested change, run one relevant syntax check, optionally perform at most one live visual check, then finish. Do not scan the project, read generated caches/vendor/node_modules, invent optional requirements, or restart planning.` });
       {
         const bridgeNowConnected = isConnected(s2.userId);
         const lastUserMsg = [...parsed.data.messages].reverse().find((m2) => m2.role === "user")?.content ?? "";
@@ -116242,10 +116245,12 @@ Tell the user to check that the agent script is still running in their terminal 
       };
       const cmdRunCount = /* @__PURE__ */ new Map();
       const commandResultCount = /* @__PURE__ */ new Map();
+      const commandResultCache = /* @__PURE__ */ new Map();
+      let mutationEpoch = 0;
       const originalUserMessage = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
-      const taskComplexity = /\b(rebuild|migrate|architecture|entire|full|multiple|complete system)\b/i.test(originalUserMessage) ? "complex" : /\b(add|update|fix|deploy|install|implement|redesign)\b/i.test(originalUserMessage) ? "moderate" : "simple";
-      const maxIterations = taskComplexity === "complex" ? 40 : taskComplexity === "moderate" ? 24 : 12;
-      const maxCommands = taskComplexity === "complex" ? 80 : taskComplexity === "moderate" ? 40 : 20;
+      const taskComplexity = simpleTaskFastPath ? "simple" : /\b(rebuild|migrate|architecture|entire|full|multiple|complete system)\b/i.test(originalUserMessage) ? "complex" : /\b(deploy|install|implement|redesign|integrate)\b/i.test(originalUserMessage) ? "moderate" : "simple";
+      const maxIterations = taskComplexity === "complex" ? 40 : taskComplexity === "moderate" ? 24 : 10;
+      const maxCommands = taskComplexity === "complex" ? 80 : taskComplexity === "moderate" ? 40 : 12;
       const homeDir = s2.username === "root" ? "/root" : `/home/${s2.username}`;
       let currentRole = "task_manager";
       let consecutiveFailBatches = 0;
@@ -116973,6 +116978,15 @@ DO NOT repeat these commands again.`;
               break;
             }
             let { cmd, desc: desc3 } = cmds[ci];
+            const normalizedForCache = normCmd(cmd);
+            const isMutatingCommand = /(?:^|[;&|]\s*)(?:sed\s+-i|perl\s+-i|cp\s|mv\s|rm\s|tee\s|printf\s|echo\s.*>|php\s+.*(?:write|put)|python\w*\s+.*(?:write|open))|(?:^|\s)>(?!>)/i.test(cmd);
+            const cacheKey = `${mutationEpoch}:${s2.id}:${normalizedForCache}`;
+            if (!isMutatingCommand && commandResultCache.has(cacheKey)) {
+              const cached = commandResultCache.get(cacheKey);
+              send2("cmd_done", { index: ci, code: cached.code, cached: true, classification: cached.classification });
+              cmdResults.push(`$ ${cmd}\n[CACHED ${cached.classification}]\n${cached.summary}\n[exit ${cached.code}]`);
+              continue;
+            }
             const destructive = DESTRUCTIVE_PATTERNS.find(({ re }) => re.test(cmd));
             if (destructive) {
               const approval = await requestApproval(cmd, destructive.reason);
@@ -117006,13 +117020,15 @@ DO NOT repeat these commands again.`;
               stderr: String(e2 instanceof Error ? e2.message : e2),
               code: -1
             }));
-            send2("cmd_done", { index: ci, code: result.code });
-            if (result.code !== 0) task.hadCommandFailure = true;
+            const commandName = /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)grep(?:\s|$)/i.test(cmd) ? "grep" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)diff(?:\s|$)/i.test(cmd) ? "diff" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)(?:test|\[)(?:\s|$)/i.test(cmd) ? "test" : cmd.trim().match(/^(?:timeout\s+\d+\s+)?(?:env\s+\S+\s+)*([\w.-]+)/)?.[1]?.toLowerCase() ?? "";
+            const toolClassification = commandName === "grep" && result.code === 1 ? "NO_MATCH" : commandName === "grep" && result.code === 2 ? "TOOL_SYNTAX_ERROR" : commandName === "diff" && result.code === 1 ? "DIFFERENCES_FOUND" : commandName === "test" && result.code === 1 ? "CONDITION_FALSE" : result.code === 0 ? "SUCCESS" : "COMMAND_FAILURE";
+            send2("cmd_done", { index: ci, code: result.code, classification: toolClassification });
+            if (toolClassification === "COMMAND_FAILURE") task.hadCommandFailure = true;
             const rawOut = [
               result.stdout.trim(),
               result.stderr.trim() ? `[stderr] ${result.stderr.trim()}` : ""
             ].filter(Boolean).join("\n") || "(no output)";
-            const trimLines = (s3, max = 60) => {
+            const trimLines = (s3, max = 20) => {
               const lines = s3.split("\n");
               if (lines.length <= max) return s3;
               const kept = lines.slice(-max);
@@ -117022,7 +117038,9 @@ ${kept.join("\n")}`;
             const out = trimLines(rawOut);
             cmdResults.push(`$ ${cmd}
 ${out}
-[exit ${result.code}]`);
+[${toolClassification}; exit ${result.code}]`);
+            if (isMutatingCommand && result.code === 0) mutationEpoch++;
+            else if (!isMutatingCommand) commandResultCache.set(cacheKey, { code: result.code, classification: toolClassification, summary: out.slice(0, 4000), timestamp: Date.now() });
           }
           if (task.status === "blocked") break;
           // Mid-task credit check before another model/tool cycle.
@@ -117043,8 +117061,8 @@ ${out}
             break;
           }
           aiMessages.push({ role: "assistant", content: raw });
-          const allFailed = cmds.length > 0 && cmdResults.every((r2) => /\[exit [^0]/.test(r2));
-          const anySucceeded = cmdResults.some((r2) => /\[exit 0\]/.test(r2));
+          const allFailed = cmds.length > 0 && cmdResults.every((r2) => /\[COMMAND_FAILURE; exit [^0]/.test(r2));
+          const anySucceeded = cmdResults.some((r2) => /\[(?:SUCCESS|NO_MATCH|DIFFERENCES_FOUND|CONDITION_FALSE); exit/.test(r2));
           if (anySucceeded) {
             consecutiveFailBatches = 0;
           } else if (allFailed) {
@@ -117057,10 +117075,10 @@ ${out}
             /^Killed\s*$/im,
             /exit code 124/,
             // timeout
-            /\[exit 124\]/
+            /\[COMMAND_FAILURE; exit 124\]/
           ];
           const blockerResult = cmdResults.find(
-            (r2) => /\[exit [^0]/.test(r2) && BLOCKER_PATTERNS.some((p) => p.test(r2))
+            (r2) => /\[COMMAND_FAILURE; exit [^0]/.test(r2) && BLOCKER_PATTERNS.some((p) => p.test(r2))
           );
           if (blockerResult && isAuto) {
             const blockerLine = blockerResult.split("\n").find((l) => BLOCKER_PATTERNS.some((p) => p.test(l))) ?? blockerResult.split("\n")[1] ?? "";
@@ -117208,7 +117226,7 @@ ${resultText}
 Now CONTINUE the task. Do NOT ask the user \u2014 search, read, and fix autonomously.`
             });
           }
-          if (!http200Confirmed && cmdResults.some((r2) => /HTTP 200/i.test(r2) && /\[exit 0\]/.test(r2))) {
+          if (!http200Confirmed && cmdResults.some((r2) => /HTTP 200/i.test(r2) && /\[SUCCESS; exit 0\]/.test(r2))) {
             http200Confirmed = true;
           }
           send2("cmd_results", { text: resultText });
@@ -117256,7 +117274,8 @@ Now CONTINUE the task. Do NOT ask the user \u2014 search, read, and fix autonomo
           }
 
           browseAttempts++;
-          if (browseAttempts > 3) {
+          const maxBrowseAttempts = taskComplexity === "simple" ? 1 : 3;
+          if (browseAttempts > maxBrowseAttempts) {
             send2("think", { text: "Screenshot SKIPPED \u2014 already browsed 3+ times this session." });
             aiMessages.push({ role: "assistant", content: raw });
             aiMessages.push({
@@ -118120,7 +118139,7 @@ Now build the next file:
             roleStartedAt = Date.now();
             continue;
           }
-          const isComplexTask = /build|rebuild|fix|deploy|install|setup|creat|redesign|payment|api|site|connect|implement|develop|add|update/i.test(userTask);
+          const isComplexTask = taskComplexity !== "simple";
           const isBrowseTask = /^browse\s+https?:\/\//i.test(userTask.trim()) || /\bbrowse\b.*https?:\/\//i.test(userTask);
           const isFileBuildTask = isAuto && /ALL FILES COMPLETE/i.test(doneMsg);
           const hasBrowseEvidence = hasBrowsed || /screenshot|vision|browser|browsed/i.test(doneMsgLower);

@@ -20,3 +20,22 @@ test("runtime failures log correlated stack details but return a safe message", 
   assert.match(source, /stack: err instanceof Error \? err\.stack/);
   assert.match(source, /return "Internal agent runtime error\."/);
 });
+
+test("simple known-file work uses the fast path and skips generic knowledge", () => {
+  assert.match(source, /const simpleTaskFastPath =/);
+  assert.match(source, /Inspect this exact source file first/);
+  assert.match(source, /simpleTaskFastPath \? Promise\.resolve\(\[\]\)/);
+  assert.match(source, /taskComplexity === "simple" \? 1 : 3/);
+});
+
+test("shell exit semantics do not turn grep no-match into repair failure", () => {
+  assert.match(source, /commandName === "grep" && result\.code === 1 \? "NO_MATCH"/);
+  assert.match(source, /commandName === "grep" && result\.code === 2 \? "TOOL_SYNTAX_ERROR"/);
+  assert.match(source, /toolClassification === "COMMAND_FAILURE"/);
+});
+
+test("read-only command results are cached until a successful mutation", () => {
+  assert.match(source, /const commandResultCache/);
+  assert.match(source, /commandResultCache\.has\(cacheKey\)/);
+  assert.match(source, /mutationEpoch\+\+/);
+});
