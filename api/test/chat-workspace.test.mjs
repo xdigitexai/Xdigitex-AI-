@@ -16,7 +16,7 @@ test("workspace supports history, new chat, follow-up, and inline persisted acti
   assert.match(workspace, /\+ New Chat/);
   assert.match(workspace, /messages:\[\{role:"user",content:text\}\]/);
   assert.match(workspace, /runs\/\$\{r\.run_id\}\/events/);
-  assert.match(workspace, /Show output/);
+  assert.match(workspace, /Command output/);
   assert.doesNotMatch(workspace, /View activity/);
   assert.match(workspace, /trigger_message_id/);
   assert.match(workspace, /PATH\\s\+\[ABC\]/);
@@ -31,4 +31,13 @@ test("server cards route reliably and execution logs scroll independently", () =
   assert.match(workspace, /New activity ↓/);
   assert.match(workspace, /CSS\.escape\(runId\)/);
   assert.match(workspace, /replace\(\/\\uFFFD\/g/);
+});
+
+test("execution details and long prompts are compact by default", () => {
+  assert.match(workspace, /Show technical details/);
+  assert.match(workspace, /Command output/);
+  assert.match(workspace, /Show more/);
+  assert.match(workspace, /content\.length>1200/);
+  assert.match(workspace, /task\.created/);
+  assert.match(workspace, /cmd_results\|credits_used\|tokens/);
 });

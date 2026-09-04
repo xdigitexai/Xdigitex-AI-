@@ -112408,9 +112408,10 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
     const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username })]);
     task.durableRunDbId = run.rows[0].id; task.durableConversationDbId = conversationDbId;
     await client.query("UPDATE conversation_messages SET run_id=$2 WHERE id=$1", [message.rows[0].id, task.durableRunDbId]);
-    const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify([{ title: "Inspect server state", required: true }, { title: "Perform requested work", required: true }, { title: "Verify result", required: true }, { title: "Deliver final report", required: true }]), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true })]);
+    const taskItems = /\bdeploy|deployment|nginx|domain|ssl\b/i.test(String(prompt)) ? ["Connect to server", "Inspect current deployment", "Inspect repository and runtime", "Install, build, and start application", "Configure domain and TLS", "Verify production"] : ["Inspect server state", "Perform requested work", "Verify result", "Deliver final report"];
+    const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify(taskItems.map((title) => ({ title, required: true }))), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true })]);
     task.durableTaskDbId = plan.rows[0].id;
-    for (const [position, title] of ["Inspect server state", "Perform requested work", "Verify result", "Deliver final report"].entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status) VALUES($1,$2,$3,$4)", [task.durableTaskDbId, position + 1, title, position === 0 ? "in_progress" : "pending"]);
+    for (const [position, title] of taskItems.entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status) VALUES($1,$2,$3,$4)", [task.durableTaskDbId, position + 1, title, position === 0 ? "in_progress" : "pending"]);
     await client.query("COMMIT");
     await Promise.all([
       rememberAgentFact({ userId: task.userId, scopeType: "user", scopeId: task.userId, key: "operating_preferences", value: { preferFreePorts: true, preserveSshConfiguration: true, restartOnlyTargetProcess: true, verifyBeforeCompletion: true, exactDomainIsolation: true, targetedFileReading: true }, source: "system_policy", confidence: 1 }),
@@ -112600,6 +112601,10 @@ function sshExec(host, port2, username, authType, privateKey, password, command 
     client.connect(connectOpts);
   });
 }
+function executeServerCommand(server, command = "echo connected", options = {}) {
+  if (!server?.id || !server?.host || !server?.username) throw new Error("SERVER_TARGET_INVALID");
+  return sshExec(server.host, server.port ?? 22, server.username, server.authType ?? "key", server.privateKey, server.password, command, options.onData, options.timeoutMs, options.signal);
+}
 router8.get("/", requireAuth, async (_req, res) => {
   const userId = res.locals["userId"];
   const servers = await db.select().from(serversTable).where(eq(serversTable.userId, userId));
@@ -112688,15 +112693,7 @@ router8.post("/:id/test", requireAuth, async (req, res) => {
     }
   }
   try {
-    const { stdout } = await sshExec(
-      s2.host,
-      s2.port,
-      s2.username,
-      s2.authType ?? "key",
-      s2.privateKey,
-      s2.password,
-      "uname -a && uptime && echo XDIGITEX_OK"
-    );
+    const { stdout } = await executeServerCommand(s2, "uname -a && uptime && echo XDIGITEX_OK");
     await db.update(serversTable).set({ status: "online", updatedAt: /* @__PURE__ */ new Date() }).where(eq(serversTable.id, s2.id));
     return res.json({ ok: true, output: stdout.trim() });
   } catch (err) {
@@ -112713,15 +112710,7 @@ router8.post("/:id/exec", requireAuth, async (req, res) => {
   const [s2] = await db.select().from(serversTable).where(and(eq(serversTable.id, parseInt(req.params.id)), eq(serversTable.userId, userId)));
   if (!s2) return res.status(404).json({ error: "Not found" });
   try {
-    const result = await sshExec(
-      s2.host,
-      s2.port,
-      s2.username,
-      s2.authType ?? "key",
-      s2.privateKey,
-      s2.password,
-      parsed.data.command
-    );
+    const result = await executeServerCommand(s2, parsed.data.command);
     return res.json(result);
   } catch (err) {
     return res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
@@ -115658,7 +115647,8 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
   await bridgeServerAgentRunStart(task, s2, task.input).catch((error) => req.log?.error({ error }, "Failed to create durable server-agent run"));
   if (parsed.data.clientMessageId && task.durableRunDbId) pool.query("UPDATE conversation_messages SET client_message_id=$1 WHERE run_id=$2 AND role='user'", [parsed.data.clientMessageId, task.durableRunDbId]).catch(()=>{});
   pool.query("UPDATE conversations SET title=CASE WHEN title IN ('New chat','New conversation') THEN $2 ELSE title END,last_message_at=NOW(),updated_at=NOW() WHERE public_id=$1 AND user_id=$3 AND server_id=$4", [conversationId, conciseConversationTitle(task.input), s2.userId, s2.id]).catch(()=>{});
-  const send2 = (type, payload) => { if (type === "think" && payload && payload.text) { const _t = payload.text; if (_t.includes("Watchdog") || _t.includes("Format error") || _t.includes("Repeated failures") || _t.includes("recovery agent") || _t.includes("subagent for JSON") || _t.includes("JSON retry") || _t.includes("Context trimmed") || _t.includes("Builder timeout") || _t.includes("UI build agent timeout") || _t.includes("Large file (") || _t.includes("Reconnecting to agent")) return; } return chatTaskEmit(task, type, payload); };
+  const emittedFallbacks = new Set();
+  const send2 = (type, payload) => { if (type === "think" && payload && payload.text) { const _t = String(payload.text).replace(/\uFFFD/g, ""); if (/^(?:PLANNING|BUILDING|NO_STATE)$/i.test(_t.trim()) || /Watchdog|Format error|Repeated failures|recovery agent|subagent for JSON|JSON retry|Context trimmed|Builder timeout|UI build agent timeout|Large file \(|Reconnecting to agent|Knowledge Base:|Crawl complete|Memory: found|Automation ·|Repeatable task/i.test(_t)) return; if (/Switching to backup agent/i.test(_t)) { const safe = "Primary AI provider unavailable. Continuing with backup model."; if (emittedFallbacks.has(safe)) return; emittedFallbacks.add(safe); payload = { ...payload, text: safe }; } else payload = { ...payload, text: _t }; } return chatTaskEmit(task, type, payload); };
   res.json({ taskId, runId, conversationId });
   // Emit run lifecycle start event
   setTimeout(() => { try { chatTaskEmit(task, "run_started", { runId, conversationId, phase: "planning" }); } catch {} }, 50);
@@ -115697,7 +115687,7 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
 
       const xd_stepMap = {
         "api":        ["Read API documentation", "Implement integration code", "Handle authentication", "Test API endpoints", "Verify response handling"],
-        "deployment": ["Check server state & logs", "Upload / update files", "Configure server (nginx/pm2)", "Restart services", "Browser verification"],
+        "deployment": ["Connect to server", "Inspect current deployment", "Inspect repository and runtime", "Install, build, and start application", "Configure domain and TLS", "Verify production"],
         "database":   ["Backup database first", "Analyse the issue", "Apply schema / data fix", "Run test queries", "Confirm data integrity"],
         "security":   ["Audit current configuration", "Identify vulnerabilities", "Apply security patches", "Test access controls", "Verify with security scan"],
         "website":    ["Inspect current site state", "Apply code / config changes", "Clear cache & restart", "Browser screenshot test", "Confirm live"],
@@ -115716,9 +115706,8 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
 
       const xd_bdg = { automation_request:"⚡ Automation", coding_task:"💻 Coding", research_task:"🔍 Research", maintenance_task:"🔧 Maintenance", general:"🎯 Task" }[xd_intent] ?? "🎯 Task";
       const xd_st  = xd_steps.map((s, i) => `  ${i+1}. ${s}`).join("\n");
-      chatTaskEmit(task, "think", {
-        text: `${xd_bdg} · ${xd_cat} · ${xd_cmpx}\n${"─".repeat(36)}\n${xd_st}${xd_auto ? "\n\n⚡ Repeatable task — workflow will be saved on completion." : ""}`
-      });
+      // Persist the structured plan only. Classification and orchestration
+      // details are internal and must not pollute the customer execution log.
     } catch {}
   })();
   // ── End XD Intent Planner ──────────────────────────────
@@ -116150,6 +116139,7 @@ void (async () => {
         { role: "system", content: xd_finalSysPrompt },
         ...parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content }))
       ];
+      aiMessages.push({ role: "user", content: `[REMOTE EXECUTION CONTRACT]\nYou are already connected through the owned server record (serverId ${s2.id}) and its saved ${s2.authType ?? "key"} credential. Every action=run command executes remotely through the backend SSH connection service. Never run ssh, sshpass, scp, sftp, or construct username@host authentication commands. Supply only the command that should execute on the connected server.` });
       if (requestedDomain) aiMessages.push({ role: "user", content: `[DOMAIN TARGET BINDING]\nSSH execution target: ${s2.username}@${s2.host}:${s2.port}. Website target: https://${requestedDomain}${requestedWebPath}. These are different identities: the server IP can serve a default virtual host and an HTTP 403 from the raw IP does not mean the requested domain failed. The expected project root is /home/${s2.username}/${requestedDomain}; stay inside that root unless direct evidence proves a different document root. Search requested literals with grep -nF, not regex grep. Verify the hostname URL first; if DNS routing is unavailable, use curl --resolve ${requestedDomain}:443:${s2.host} https://${requestedDomain}${requestedWebPath}. A login redirect can be valid behavior. For a small source change, exact source/literal evidence plus the relevant syntax check is sufficient; a browser screenshot is optional and its absence must not force PARTIAL. Once the requested state and relevant verification pass, emit done immediately without extra discovery commands.` });
       if (simpleTaskFastPath) aiMessages.push({ role: "user", content: `[SIMPLE TASK FAST PATH]\nOriginal request (authoritative): ${userTaskText.slice(0, 1200)}\nExact target: ${explicitTargetMatch[1]}\nInspect this exact source file first. If the requested state already exists, do not edit it: run one relevant syntax check, verify the requested meaning, then finish. Otherwise make only the requested change, run one relevant syntax check, optionally perform at most one live visual check, then finish. Do not scan the project, read generated caches/vendor/node_modules, invent optional requirements, or restart planning.` });
       {
@@ -117043,6 +117033,11 @@ DO NOT repeat these commands again.`;
               break;
             }
             let { cmd, desc: desc3 } = cmds[ci];
+            if (/(?:^|[;&|]\s*)(?:timeout\s+\d+\s+)?(?:ssh|sshpass|scp|sftp)\b/i.test(cmd)) {
+              send2("step", { text: "Using the saved server credential through the secure connection service." });
+              cmdResults.push(`[CONNECTION_WRAPPER_REJECTED]\nThis run is already authenticated to serverId ${s2.id}. Retry with only the remote command; do not invoke ssh, sshpass, scp, or sftp.\n[exit 64]`);
+              continue;
+            }
             const normalizedForCache = normCmd(cmd);
             const isMutatingCommand = /(?:^|[;&|]\s*)(?:sed\s+-i|perl\s+-i|cp\s|mv\s|rm\s|tee\s|printf\s|echo\s.*>|php\s+.*(?:write|put)|python\w*\s+.*(?:write|open))|(?:^|\s)>(?!>)/i.test(cmd);
             const cacheKey = `${mutationEpoch}:${s2.id}:${normalizedForCache}`;
@@ -117069,22 +117064,20 @@ DO NOT repeat these commands again.`;
             }
             trackFileWrites(cmd, task);
             send2("cmd_start", { index: ci, total: cmds.length, cmd, desc: desc3 });
-            const result = await sshExec(
-              s2.host,
-              s2.port,
-              s2.username,
-              s2.authType ?? "key",
-              s2.privateKey,
-              s2.password,
-              cmd,
-              (chunk) => send2("cmd_output", { index: ci, chunk }),
-              void 0,
-              task.abort.signal
-            ).catch((e2) => ({
+            const result = await executeServerCommand(s2, cmd, {
+              onData: (chunk) => send2("cmd_output", { index: ci, chunk }),
+              signal: task.abort.signal
+            }).catch((e2) => ({
               stdout: "",
               stderr: String(e2 instanceof Error ? e2.message : e2),
               code: -1
             }));
+            if (result.code === -1 && /permission denied|all configured authentication methods failed|authentication failed/i.test(result.stderr)) {
+              task.status = "blocked";
+              send2("task_failed_item", { task: "Connect to server", text: "Saved server credential could not authenticate.", code: "SSH_AUTH_FAILED" });
+              send2("reply", { text: `Blocked.\n\nUnable to authenticate to ${s2.name || "server"} using its saved server credential.\n\nNo files, processes, domains, or services were changed.\n\nServer:\n${s2.username}@${s2.host}:${s2.port}` });
+              break;
+            }
             const commandName = /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)grep(?:\s|$)/i.test(cmd) ? "grep" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)diff(?:\s|$)/i.test(cmd) ? "diff" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)(?:test|\[)(?:\s|$)/i.test(cmd) ? "test" : cmd.trim().match(/^(?:timeout\s+\d+\s+)?(?:env\s+\S+\s+)*([\w.-]+)/)?.[1]?.toLowerCase() ?? "";
             const toolClassification = commandName === "grep" && result.code === 1 ? "NO_MATCH" : commandName === "grep" && result.code === 2 ? "TOOL_SYNTAX_ERROR" : commandName === "diff" && result.code === 1 ? "DIFFERENCES_FOUND" : commandName === "test" && result.code === 1 ? "CONDITION_FALSE" : result.code === 0 ? "SUCCESS" : "COMMAND_FAILURE";
             send2("cmd_done", { index: ci, code: result.code, classification: toolClassification });

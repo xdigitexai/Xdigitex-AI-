@@ -67,3 +67,19 @@ test("domain-bound tasks verify the hostname instead of the SSH address", () => 
   assert.match(source, /grep -nF/);
   assert.match(source, /Automation was not requested/);
 });
+
+test("test, terminal, and agent share saved server credential execution", () => {
+  assert.match(source, /function executeServerCommand\(server/);
+  assert.match(source, /executeServerCommand\(s2, "uname -a/);
+  assert.match(source, /executeServerCommand\(s2, parsed\.data\.command\)/);
+  assert.match(source, /executeServerCommand\(s2, cmd,/);
+  assert.match(source, /CONNECTION_WRAPPER_REJECTED/);
+  assert.match(source, /SSH_AUTH_FAILED/);
+});
+
+test("normal execution hides orchestration noise and uses a real deployment plan", () => {
+  assert.match(source, /Primary AI provider unavailable\. Continuing with backup model/);
+  assert.match(source, /Knowledge Base:\|Crawl complete/);
+  assert.match(source, /Inspect current deployment/);
+  assert.match(source, /Configure domain and TLS/);
+});
