@@ -112306,7 +112306,8 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
       [task.conversationId, task.userId, String(prompt || "Server task").slice(0, 80), server.id, JSON.stringify({ source: "server-agent", serverName: server.name, host: server.host, port: server.port, username: server.username })]
     );
     const conversationDbId = conversation.rows[0].id;
-    const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1 FOR UPDATE", [conversationDbId])).rows[0].n;
+    await client.query("SELECT pg_advisory_xact_lock($1)", [conversationDbId]);
+    const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1", [conversationDbId])).rows[0].n;
     const message = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,role,content,sequence,metadata) VALUES($1,$2,'user',$3,$4,$5) RETURNING id`, [randomUUID2(), conversationDbId, prompt, sequence, JSON.stringify({ source: "server-agent", serverId: server.id })]);
     const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username })]);
     task.durableRunDbId = run.rows[0].id; task.durableConversationDbId = conversationDbId;
@@ -112328,7 +112329,8 @@ async function bridgeServerAgentRunFinish(task) {
     await client.query("UPDATE coding_agent_runs SET status=$2,phase=$2,heartbeat_at=NOW(),completed_at=NOW(),lock_token=NULL,updated_at=NOW(),error=CASE WHEN $2='failed' THEN $3 ELSE error END WHERE id=$1", [task.durableRunDbId, status, failed ? finalText : null]);
     await client.query("UPDATE agent_tasks SET status=$2,updated_at=NOW() WHERE id=$1", [task.durableTaskDbId, status]);
     await client.query("UPDATE agent_task_items SET status=CASE WHEN $2='completed' THEN 'completed' WHEN status='in_progress' THEN 'failed' ELSE status END,evidence=CASE WHEN $2='completed' THEN $3 ELSE evidence END,updated_at=NOW() WHERE task_id=$1", [task.durableTaskDbId, status, JSON.stringify({ finalResponseStored: true, filesModified: task.filesModified ?? [] })]);
-    const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1 FOR UPDATE", [task.durableConversationDbId])).rows[0].n;
+    await client.query("SELECT pg_advisory_xact_lock($1)", [task.durableConversationDbId]);
+    const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1", [task.durableConversationDbId])).rows[0].n;
     const final = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,run_id,role,content,sequence,metadata) VALUES($1,$2,$3,'assistant',$4,$5,$6) RETURNING id`, [randomUUID2(), task.durableConversationDbId, task.durableRunDbId, finalText, sequence, JSON.stringify({ final: true, status, filesModified: task.filesModified ?? [] })]);
     await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ finalMessageId: final.rows[0].id, actionCount: task.timeline?.length ?? 0, filesModified: task.filesModified ?? [] })]);
     await client.query("UPDATE conversations SET last_message_at=NOW(),updated_at=NOW() WHERE id=$1", [task.durableConversationDbId]);
