@@ -112270,20 +112270,6 @@ pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS run_id TEXT
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS conversation_id TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS final_response TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS steps TEXT`).catch(()=>{});
-pool.query(`CREATE TABLE IF NOT EXISTS agent_scoped_memory (
-  id BIGSERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  scope_type TEXT NOT NULL CHECK(scope_type IN ('user','server','project','conversation')),
-  scope_id TEXT NOT NULL,
-  key TEXT NOT NULL,
-  value JSONB NOT NULL,
-  source TEXT NOT NULL,
-  confidence NUMERIC(4,3) NOT NULL DEFAULT 1,
-  last_verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE(user_id,scope_type,scope_id,key)
-)`).catch(e => console.error('[agent_memory] table init:', e.message));
 setInterval(() => {
   const cutoff = Date.now() - 4 * 60 * 60 * 1e3;
   for (const [id, task] of chatTaskStore) {
