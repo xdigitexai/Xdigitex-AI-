@@ -38,9 +38,13 @@ test("server cards route reliably and execution logs scroll independently", () =
 test("execution details and long prompts are compact by default", () => {
   assert.match(workspace, /Show technical details/);
   assert.match(workspace, /Command output/);
-  assert.match(workspace, /Show full prompt/);
+  assert.match(workspace, /Show full/);
   assert.match(workspace, /content\.length>2000/);
   assert.match(workspace, /Open as \.txt/);
+  assert.match(workspace, /data-copy/);
+  assert.match(workspace, /navigator\.clipboard\.writeText/);
+  assert.match(workspace, /showModal/);
+  assert.doesNotMatch(workspace, /class="prompt-more"/);
   assert.match(workspace, /task\.created/);
   assert.match(workspace, /cmd_results\|credits_used\|tokens/);
 });
@@ -50,6 +54,8 @@ test("run card renders authoritative TODO and target context", () => {
   assert.match(workspace, /r\.todo_items/);
   assert.match(workspace, /HOSTING \/ CPANEL/);
   assert.match(workspace, /Project:/);
+  assert.match(workspace, /Public IP:/);
+  assert.match(workspace, /Origin:/);
   assert.match(workspace, /Database:/);
   assert.match(workspace, /event\.type==="todo\.created"/);
   assert.match(workspace, /event\.type==="target\.updated"/);

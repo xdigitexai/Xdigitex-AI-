@@ -112394,7 +112394,10 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
   const promptText = String(prompt || "");
   const repository = promptText.match(/https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)/i)?.[1]?.replace(/\.git$/i, "") ?? null;
   const domain = [...promptText.matchAll(/\b((?:[a-z0-9-]+\.)+[a-z]{2,})(?:\/|\b)/ig)].map((match) => match[1].toLowerCase()).find((value) => !["github.com", "www.github.com"].includes(value)) ?? null;
-  const targetContext = { targetType: server.cpanelUrl || Number(server.port) !== 22 ? "cpanel" : "vps", targetId: server.id, serverId: server.id, host: server.host, port: server.port, username: server.username, projectName: repository?.split("/").pop() ?? null, repository, domain };
+  const targetType = server.cpanelUrl ? "cpanel" : "vps";
+  const serverPublicIp = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(server.host || "")) ? server.host : null;
+  const targetContext = { targetType, targetId: server.id, serverId: server.id, host: server.host, port: server.port, sshPort: server.port, username: server.username, serverPublicIp, projectName: repository?.split("/").pop() ?? null, repository, domain };
+  task.targetContext = targetContext;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -112487,14 +112490,43 @@ async function reconcileRunDiscoveries(task, output) {
   const text = String(output || "");
   const discovered = {};
   const projectRoot = text.match(/(?:^|\s)(\/(?:var\/www|home|opt)\/[\w./-]+)/m)?.[1];
-  const appPort = text.match(/127\.0\.0\.1:(\d{2,5})/)?.[1];
+  const listen = text.match(/\b(127\.0\.0\.1|0\.0\.0\.0|localhost|\[::\]|::):(\d{2,5})\b/i);
+  const appPort = listen?.[2] ?? text.match(/\b(?:PORT|port)\s*[=:]\s*(\d{2,5})\b/i)?.[1];
   const processName = text.match(/(?:pm2[^\n]*|name[^\n]*?)\b([a-z0-9][a-z0-9_-]*(?:airtel|starlink)[a-z0-9_-]*)\b/i)?.[1];
   if (projectRoot) discovered.projectRoot = projectRoot.replace(/[,:;]+$/, "");
   if (appPort) discovered.appPort = Number(appPort);
+  if (listen) discovered.appBind = listen[1].toLowerCase() === "localhost" ? "127.0.0.1" : listen[1];
   if (processName) discovered.processName = processName;
+  if (/\b(?:docker compose|docker-compose)\b/i.test(text)) { discovered.docker = true; discovered.deploymentMethod = "Docker Compose"; discovered.processManager = "Docker Compose"; }
+  else if (/\bDockerfile\b|\bdocker (?:build|run)\b/i.test(text)) { discovered.docker = true; discovered.deploymentMethod = "Docker"; discovered.processManager = "Docker"; }
+  else if (/\bpm2\b/i.test(text)) { discovered.processManager = "PM2"; discovered.deploymentMethod = "PM2"; }
+  else if (/\bsystemctl\b|\bsystemd\b/i.test(text)) { discovered.processManager = "systemd"; discovered.deploymentMethod = "systemd"; }
+  else if (/\bpassenger\b/i.test(text)) { discovered.processManager = "Passenger"; discovered.deploymentMethod = "Passenger"; }
+  if (/\bnginx\b/i.test(text)) discovered.webServer = "Nginx";
+  else if (/\bapache2?\b|\bhttpd\b/i.test(text)) discovered.webServer = "Apache";
+  if (/\bpnpm-lock\.yaml\b|\bpnpm (?:install|run|build)\b/i.test(text)) discovered.packageManager = "pnpm";
+  else if (/\byarn\.lock\b|\byarn (?:install|build)\b/i.test(text)) discovered.packageManager = "yarn";
+  else if (/\bpackage-lock\.json\b|\bnpm (?:ci|install|run)\b/i.test(text)) discovered.packageManager = "npm";
+  else if (/\bcomposer\.json\b|\bcomposer install\b/i.test(text)) discovered.packageManager = "composer";
+  else if (/\bpoetry\.lock\b|\bpoetry install\b/i.test(text)) discovered.packageManager = "poetry";
+  else if (/\brequirements\.txt\b|\bpip(?:3)? install\b/i.test(text)) discovered.packageManager = "pip";
+  const stacks = [];
+  if (/\bnext(?:\.js)?\b|next\.config/i.test(text)) stacks.push("Next.js");
+  if (/\bvite\b|vite\.config/i.test(text)) stacks.push("Vite");
+  if (/\breact\b/i.test(text)) stacks.push("React");
+  if (/\bnestjs\b|@nestjs/i.test(text)) stacks.push("NestJS"); else if (/\bexpress\b/i.test(text)) stacks.push("Express");
+  if (/\blaravel\b|\bartisan\b/i.test(text)) stacks.push("Laravel"); else if (/\bphp\b|composer\.json/i.test(text)) stacks.push("PHP");
+  if (/\bdjango\b|manage\.py/i.test(text)) stacks.push("Django"); else if (/\bflask\b/i.test(text)) stacks.push("Flask");
+  if (/\bgo\.mod\b/i.test(text)) stacks.push("Go");
+  if (/\bCargo\.toml\b/i.test(text)) stacks.push("Rust");
+  if (stacks.length) discovered.stack = [...new Set(stacks)].join(" + ");
+  if (/\bnode(?:\.js)?\b|package\.json/i.test(text)) discovered.runtime = "Node.js";
+  else if (/\bpython(?:3)?\b|pyproject\.toml|requirements\.txt/i.test(text)) discovered.runtime = "Python";
+  else if (/\bphp\b|composer\.json/i.test(text)) discovered.runtime = "PHP";
   if (/\bpostgres(?:ql)?\b|@prisma\/adapter-pg|\bpg\b/i.test(text)) discovered.databaseType = "PostgreSQL";
   else if (/\bmysql\b|\bmariadb\b/i.test(text)) discovered.databaseType = "MySQL/MariaDB";
   if (Object.keys(discovered).length && task.durableRunDbId) {
+    task.targetContext = { ...(task.targetContext || {}), ...discovered };
     await pool.query("UPDATE coding_agent_runs SET metadata=jsonb_set(metadata,'{targetContext}',COALESCE(metadata->'targetContext','{}'::jsonb)||$2::jsonb,true),updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify(discovered)]);
     chatTaskEmit(task, "target_context", discovered);
   }
@@ -116219,7 +116251,7 @@ void (async () => {
         ...parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content }))
       ];
       aiMessages.push({ role: "user", content: `[REMOTE EXECUTION CONTRACT]\nYou are already connected through the owned server record (serverId ${s2.id}) and its saved ${s2.authType ?? "key"} credential. Every action=run command executes remotely through the backend SSH connection service. Never run ssh, sshpass, scp, sftp, or construct username@host authentication commands. Supply only the command that should execute on the connected server.` });
-      if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText)) aiMessages.push({ role: "user", content: `[DEPLOYMENT AUTONOMY]\nComplete discoverable, app-specific prerequisites instead of stopping at the first recoverable error. If DATABASE_URL is missing, inspect the repository's actual ORM/schema/migration configuration, identify the required database type, check the installed service, and—when safe—provision an isolated database and application user, configure the secret server-side without printing it, run the repository's real production-safe migration command, restart only the target process, and verify fresh logs plus a real application route. Never reuse, drop, truncate, or alter another project's database. PM2 online and curl --insecure are not proof of health: reconcile PID/port/latest logs and verify TLS normally. New requirements are added to the durable TODO automatically; continue unless an external prerequisite genuinely blocks execution.` });
+      if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText)) aiMessages.push({ role: "user", content: `[PROFESSIONAL DEPLOYMENT CONTRACT]\nWork manifest-first and stay bounded: inspect only existing deployment manifests, package/runtime manifests, README deployment instructions, environment examples, and the actual entry point before reading source. Detect Docker/Compose before reconstructing a manual deployment. Cache the discovered stack, package manager, project root, process manager, web server, application bind and port; do not rediscover unchanged facts. Treat every project as isolated and never stop another project to obtain a preferred port.\n\nExplicitly distinguish the connected execution target (VPS, cPanel/shared hosting, or local computer) from browser verification. On a VPS, detect whether the app listens on loopback or a public interface and perform the correct origin check from the VPS. On cPanel, discover the requested domain's real document root; never assume public_html. Origin health is never final website health. The final website check uses the actual HTTPS hostname (or curl --resolve with hostname/SNI while DNS propagates), without --insecure.\n\nBefore deployment, derive expected behavior from the repository: API-only, frontend, or full-stack, plus at least one recognizable title, brand, root element, or asset. For frontend/full-stack work, inspect the public response body and separately verify referenced JavaScript/CSS/assets; JSON health at / and PM2 online do not prove a frontend deployment. Verify the API separately when present. If the public root serves an API, default page, stale app, blank shell, or broken assets instead of the expected frontend, fix routing and continue. Use a real browser when available for final render verification.\n\nComplete safe prerequisites autonomously. If DATABASE_URL is missing, inspect the actual ORM/schema/migrations, provision an isolated database and application user when safe, configure secrets without printing them, migrate, restart only the target process, and verify fresh logs and database-backed behavior. Add newly discovered requirements to the durable TODO immediately. Finish only when the requested application is accessible at its requested destination, or report the exact external blocker and preserved state.` });
       if (requestedDomain) aiMessages.push({ role: "user", content: `[DOMAIN TARGET BINDING]\nSSH execution target: ${s2.username}@${s2.host}:${s2.port}. Website target: https://${requestedDomain}${requestedWebPath}. These are different identities: the server IP can serve a default virtual host and an HTTP 403 from the raw IP does not mean the requested domain failed. The expected project root is /home/${s2.username}/${requestedDomain}; stay inside that root unless direct evidence proves a different document root. Search requested literals with grep -nF, not regex grep. Verify the hostname URL first; if DNS routing is unavailable, use curl --resolve ${requestedDomain}:443:${s2.host} https://${requestedDomain}${requestedWebPath}. A login redirect can be valid behavior. For a small source change, exact source/literal evidence plus the relevant syntax check is sufficient; a browser screenshot is optional and its absence must not force PARTIAL. Once the requested state and relevant verification pass, emit done immediately without extra discovery commands.` });
       if (simpleTaskFastPath) aiMessages.push({ role: "user", content: `[SIMPLE TASK FAST PATH]\nOriginal request (authoritative): ${userTaskText.slice(0, 1200)}\nExact target: ${explicitTargetMatch[1]}\nInspect this exact source file first. If the requested state already exists, do not edit it: run one relevant syntax check, verify the requested meaning, then finish. Otherwise make only the requested change, run one relevant syntax check, optionally perform at most one live visual check, then finish. Do not scan the project, read generated caches/vendor/node_modules, invent optional requirements, or restart planning.` });
       {
