@@ -25,19 +25,22 @@ test("workspace supports history, new chat, follow-up, and inline persisted acti
 
 test("server cards route reliably and execution logs scroll independently", () => {
   assert.match(workspace, /body\.items\|\|body\.servers\|\|body\.data/);
-  assert.match(workspace, /location\.assign\(`\/servers\/\$\{server\.id\}\/chats`\)/);
+  assert.match(workspace, /\/servers\/\$\{server\.id\}\/conversations/);
   assert.match(workspace, /max-height:400px/);
   assert.match(workspace, /max-height:45vh/);
   assert.match(workspace, /New activity ↓/);
   assert.match(workspace, /CSS\.escape\(runId\)/);
   assert.match(workspace, /replace\(\/\\uFFFD\/g/);
+  assert.match(workspace, /Conversation creation failed/);
+  assert.match(workspace, /conversation\.canonicalUrl/);
 });
 
 test("execution details and long prompts are compact by default", () => {
   assert.match(workspace, /Show technical details/);
   assert.match(workspace, /Command output/);
-  assert.match(workspace, /Show more/);
-  assert.match(workspace, /content\.length>1200/);
+  assert.match(workspace, /Show full prompt/);
+  assert.match(workspace, /content\.length>2000/);
+  assert.match(workspace, /Open as \.txt/);
   assert.match(workspace, /task\.created/);
   assert.match(workspace, /cmd_results\|credits_used\|tokens/);
 });

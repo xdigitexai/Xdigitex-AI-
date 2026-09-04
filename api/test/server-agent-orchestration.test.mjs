@@ -83,3 +83,17 @@ test("normal execution hides orchestration noise and uses a real deployment plan
   assert.match(source, /Inspect current deployment/);
   assert.match(source, /Configure domain and TLS/);
 });
+
+test("durable TODO progress advances from the authenticated connection", () => {
+  assert.match(source, /async function completeRunTask\(task, evidence\)/);
+  assert.match(source, /status='completed',evidence=\$2/);
+  assert.match(source, /await executeServerCommand\(s2, "printf XDIGITEX_CONNECTED"/);
+  assert.match(source, /await completeRunTask\(task, \{ connection: "authenticated"/);
+  assert.match(source, /await completeRunTask\(task, \{ commandBatch: "completed"/);
+});
+
+test("timeouts are task-aware and distinct from generic failures", () => {
+  assert.match(source, /timeout 900/);
+  assert.match(source, /result\.code === 124 \? "COMMAND_TIMEOUT"/);
+  assert.match(source, /COMMAND_FAILURE\|COMMAND_TIMEOUT/);
+});

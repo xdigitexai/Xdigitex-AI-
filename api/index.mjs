@@ -112440,6 +112440,22 @@ async function bridgeServerAgentRunFinish(task) {
     await client.query("COMMIT");
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 }
+async function completeRunTask(task, evidence) {
+  if (!task?.durableTaskDbId) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const current = await client.query("SELECT id,position,title FROM agent_task_items WHERE task_id=$1 AND status='in_progress' ORDER BY position LIMIT 1 FOR UPDATE", [task.durableTaskDbId]);
+    if (!current.rowCount) { await client.query("COMMIT"); return; }
+    const item = current.rows[0];
+    await client.query("UPDATE agent_task_items SET status='completed',evidence=$2,updated_at=NOW() WHERE id=$1", [item.id, JSON.stringify(evidence ?? {})]);
+    const next = await client.query("UPDATE agent_task_items SET status='in_progress',updated_at=NOW() WHERE id=(SELECT id FROM agent_task_items WHERE task_id=$1 AND status='pending' ORDER BY position LIMIT 1) RETURNING title,position", [task.durableTaskDbId]);
+    await client.query("UPDATE agent_runs SET heartbeat_at=NOW(),current_step=$2 WHERE run_id=$1", [task.runId, next.rows[0]?.title ?? "Finalizing response"]);
+    await client.query("COMMIT");
+    chatTaskEmit(task, "task_complete", { task: item.title, position: item.position });
+    if (next.rowCount) chatTaskEmit(task, "task_start", { task: next.rows[0].title, position: next.rows[0].position });
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+}
 async function generateTaskTitle(task, summary) {
   const CATEGORIES = ["website", "bugfix", "deployment", "security", "vps", "email", "automation", "database", "api", "general"];
   try {
@@ -115653,6 +115669,21 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
   // Emit run lifecycle start event
   setTimeout(() => { try { chatTaskEmit(task, "run_started", { runId, conversationId, phase: "planning" }); } catch {} }, 50);
 
+  // Establish the required prerequisite before planning dependent server work.
+  // This uses the same owned server record and credential service as Test/Terminal.
+  try {
+    await executeServerCommand(s2, "printf XDIGITEX_CONNECTED", { timeoutMs: 2e4, signal: task.abort.signal });
+    await completeRunTask(task, { connection: "authenticated", serverId: s2.id });
+  } catch (error) {
+    task.status = "blocked";
+    chatTaskEmit(task, "task_failed_item", { task: "Connect to server", text: "Saved server credential could not authenticate.", code: "SSH_AUTH_FAILED" });
+    chatTaskEmit(task, "reply", { text: `Blocked.\n\nThe saved credential could not connect to:\n${s2.username}@${s2.host}:${s2.port}\n\n0 deployment tasks were completed.\n\nNo server changes were made.` });
+    await bridgeServerAgentRunFinish(task).catch(() => {});
+    chatTaskEmit(task, "run_blocked", { runId, conversationId, status: "blocked" });
+    chatTaskEmit(task, "stream_end", {});
+    return;
+  }
+
   // ── XD Intent Planner ──────────────────────────────────────
   // Keyword classifier — runs before the AI loop, zero latency, zero cost
   (function xd_runPlanner() {
@@ -116423,7 +116454,7 @@ Tell the user to check that the agent script is still running in their terminal 
           iterClient = getAIClient("openai");
           iterProvider = "openai";
         }
-        if (isAuto) {
+        if (isAuto && false) {
           const prevRole = currentRole;
           if (iter === 0) {
             currentRole = "task_manager";
@@ -117033,6 +117064,8 @@ DO NOT repeat these commands again.`;
               break;
             }
             let { cmd, desc: desc3 } = cmds[ci];
+            const isLongRunningBuild = /\b(?:pnpm|npm|yarn)\s+(?:install|ci|build)|\bdocker\s+build|\bcomposer\s+install/i.test(cmd);
+            if (isLongRunningBuild && /^\s*timeout\s+\d+\s+/i.test(cmd)) cmd = cmd.replace(/^\s*timeout\s+\d+\s+/i, "timeout 900 ");
             if (/(?:^|[;&|]\s*)(?:timeout\s+\d+\s+)?(?:ssh|sshpass|scp|sftp)\b/i.test(cmd)) {
               send2("step", { text: "Using the saved server credential through the secure connection service." });
               cmdResults.push(`[CONNECTION_WRAPPER_REJECTED]\nThis run is already authenticated to serverId ${s2.id}. Retry with only the remote command; do not invoke ssh, sshpass, scp, or sftp.\n[exit 64]`);
@@ -117079,7 +117112,7 @@ DO NOT repeat these commands again.`;
               break;
             }
             const commandName = /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)grep(?:\s|$)/i.test(cmd) ? "grep" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)diff(?:\s|$)/i.test(cmd) ? "diff" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)(?:test|\[)(?:\s|$)/i.test(cmd) ? "test" : cmd.trim().match(/^(?:timeout\s+\d+\s+)?(?:env\s+\S+\s+)*([\w.-]+)/)?.[1]?.toLowerCase() ?? "";
-            const toolClassification = commandName === "grep" && result.code === 1 ? "NO_MATCH" : commandName === "grep" && result.code === 2 ? "TOOL_SYNTAX_ERROR" : commandName === "diff" && result.code === 1 ? "DIFFERENCES_FOUND" : commandName === "test" && result.code === 1 ? "CONDITION_FALSE" : result.code === 0 ? "SUCCESS" : "COMMAND_FAILURE";
+            const toolClassification = result.code === 124 ? "COMMAND_TIMEOUT" : commandName === "grep" && result.code === 1 ? "NO_MATCH" : commandName === "grep" && result.code === 2 ? "TOOL_SYNTAX_ERROR" : commandName === "diff" && result.code === 1 ? "DIFFERENCES_FOUND" : commandName === "test" && result.code === 1 ? "CONDITION_FALSE" : result.code === 0 ? "SUCCESS" : "COMMAND_FAILURE";
             send2("cmd_done", { index: ci, code: result.code, classification: toolClassification });
             if (toolClassification === "COMMAND_FAILURE") task.hadCommandFailure = true;
             const rawOut = [
@@ -117119,10 +117152,11 @@ ${out}
             break;
           }
           aiMessages.push({ role: "assistant", content: raw });
-          const allFailed = cmds.length > 0 && cmdResults.every((r2) => /\[COMMAND_FAILURE; exit [^0]/.test(r2));
+          const allFailed = cmds.length > 0 && cmdResults.every((r2) => /\[(?:COMMAND_FAILURE|COMMAND_TIMEOUT); exit [^0]/.test(r2));
           const anySucceeded = cmdResults.some((r2) => /\[(?:SUCCESS|NO_MATCH|DIFFERENCES_FOUND|CONDITION_FALSE); exit/.test(r2));
           if (anySucceeded) {
             consecutiveFailBatches = 0;
+            await completeRunTask(task, { commandBatch: "completed", successfulCommands: cmdResults.filter((r2) => /\[(?:SUCCESS|NO_MATCH|DIFFERENCES_FOUND|CONDITION_FALSE); exit/.test(r2)).length });
           } else if (allFailed) {
             consecutiveFailBatches++;
           }
@@ -117133,7 +117167,7 @@ ${out}
             /^Killed\s*$/im,
             /exit code 124/,
             // timeout
-            /\[COMMAND_FAILURE; exit 124\]/
+            /\[COMMAND_TIMEOUT; exit 124\]/
           ];
           const blockerResult = cmdResults.find(
             (r2) => /\[COMMAND_FAILURE; exit [^0]/.test(r2) && BLOCKER_PATTERNS.some((p) => p.test(r2))
