@@ -116112,7 +116112,9 @@ void (async () => {
       // ── Verification Engine ───────────────────────────────────────────────
       var xd_verPlan = {profiles:[],steps:[],missionBlock:"",needsAuth:false,canSelfRegister:false};
       try {
-        xd_verPlan = xd_runVerificationEngine(userTaskText, 3);
+        // Exact-file/simple requests must not inherit broad site, checkout, auth,
+        // or payment verification profiles. The fast path verifies only the task.
+        xd_verPlan = simpleTaskFastPath ? {profiles:[],steps:[],missionBlock:"",needsAuth:false,canSelfRegister:false} : xd_runVerificationEngine(userTaskText, 3);
         if (xd_verPlan.profiles.length > 0) {
           send2("verification_plan", {
             profiles: xd_verPlan.profiles.map(function(m) { return { name: m.profile.meta.name, file: m.profile.file, confidence: m.confidence, keywords: m.matchedKeywords }; }),
@@ -119138,6 +119140,32 @@ router8.get("/:id/conversations/:conversationId/runs/:runId/activity", requireAu
   if (!owned.rowCount) return res.status(404).json({ error: "Run not found" });
   const [events, tools] = await Promise.all([pool.query("SELECT sequence,type,payload,created_at FROM agent_run_events WHERE run_id=$1 ORDER BY sequence LIMIT 500", [owned.rows[0].id]), pool.query("SELECT public_id,name,status,input,result,duration_ms,started_at,completed_at FROM agent_tool_calls WHERE run_id=$1 ORDER BY id LIMIT 200", [owned.rows[0].id])]);
   res.json({ events: events.rows, toolCalls: tools.rows });
+});
+router8.get("/:id/conversations/:conversationId/runs/:runId/events", requireAuth, async (req, res) => {
+  const owned = await pool.query("SELECT r.id,r.status FROM coding_agent_runs r JOIN conversations c ON c.id=r.conversation_id JOIN servers s ON s.id=c.server_id WHERE r.public_id=$1 AND c.public_id=$2 AND c.server_id=$3 AND c.user_id=$4 AND s.user_id=$4", [req.params.runId, req.params.conversationId, parseInt(req.params.id), res.locals["userId"]]);
+  if (!owned.rowCount) return res.status(404).end();
+  let cursor = Math.max(0, Number(req.headers["last-event-id"] || req.query.after) || 0), closed = false;
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+  req.on("close", () => { closed = true; });
+  while (!closed) {
+    const events = await pool.query("SELECT sequence,type,payload,created_at FROM agent_run_events WHERE run_id=$1 AND sequence>$2 ORDER BY sequence LIMIT 200", [owned.rows[0].id, cursor]);
+    for (const event of events.rows) {
+      cursor = event.sequence;
+      res.write(`id: ${event.sequence}\nevent: activity\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+    const state = await pool.query("SELECT status FROM coding_agent_runs WHERE id=$1", [owned.rows[0].id]);
+    const runStatus = state.rows[0]?.status;
+    if (["completed","partially_completed","failed","blocked","cancelled"].includes(runStatus)) {
+      res.write(`event: terminal\ndata: ${JSON.stringify({ status: runStatus })}\n\n`);
+      res.end();
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
 });
 router8.get("/:id/history", requireAuth, async (req, res) => {
   const userId = res.locals["userId"];
