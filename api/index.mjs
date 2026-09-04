@@ -98359,6 +98359,10 @@ async function requireAuth(req, res, next) {
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
+  if (user.status !== "active") {
+    res.status(403).json({ error: "Account is suspended or disabled" });
+    return;
+  }
   res.locals["userId"] = user.id;
   res.locals["user"] = user;
   res.locals["token"] = req.headers.authorization?.slice(7) ?? "";
@@ -98394,13 +98398,21 @@ router2.post("/login", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
   const { email: email3 } = parsed.data;
   const [user] = await db.select().from(usersTable).where(eq(usersTable.email, email3));
-  if (!user) return res.status(401).json({ error: "Invalid credentials" });
+  if (!user) {
+    recordLoginAttempt(pool, req, { identifier: email3, success: false, failure: "invalid_credentials" }).catch(() => {});
+    return res.status(401).json({ error: "Invalid credentials" });
+  }
+  if (user.status !== "active") {
+    recordLoginAttempt(pool, req, { userId: user.id, identifier: email3, success: false, failure: "account_restricted" }).catch(() => {});
+    return res.status(403).json({ error: "Account is suspended or disabled" });
+  }
   const { passwordHash: _, ...safeUser } = user;
   const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ?? req.socket.remoteAddress ?? void 0;
   const ua = req.headers["user-agent"] ?? void 0;
   sendLoginNotification({ to: email3, name: user.name, ip, userAgent: ua }).catch(
     (err) => req.log?.warn({ err }, "Failed to send login notification email")
   );
+  recordLoginAttempt(pool, req, { userId: user.id, identifier: email3, success: true, sessionRef: `mock-token-${user.id}` }).catch(() => {});
   return res.json({ user: safeUser, token: `mock-token-${user.id}` });
 });
 router2.get("/me", async (req, res) => {
@@ -124958,6 +124970,7 @@ var routes_default = router33;
 
 // src/app.ts
 import { installAgentRuntime, recoverStaleRuns, redactSecrets } from "./agent-runtime.mjs";
+import { installAdminRuntime, recordLoginAttempt } from "./admin-runtime.mjs";
 var app = (0, import_express34.default)();
 app.use(
   (0, import_pino_http.default)({
@@ -124982,6 +124995,7 @@ app.use((0, import_cors.default)());
 app.use(import_express34.default.json({ limit: "50mb" }));
 app.use(import_express34.default.urlencoded({ extended: true, limit: "50mb" }));
 await installAgentRuntime(app, pool);
+await installAdminRuntime(app, pool);
 app.use("/api", routes_default);
 var app_default = app;
 
