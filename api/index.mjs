@@ -112315,7 +112315,7 @@ function chatTaskEmit(task, type, payload) {
   task.eventBuffer.push({ type, payload });
   if ((type === "reply" || type === "done") && payload?.text) task.lastReply = payload.text;
   if (task?.durableRunDbId) {
-    const eventType = ({ run_started: "run.started", run_completed: "run.completed", run_failed: task.status === "cancelled" ? "run.cancelled" : task.status === "blocked" ? "run.blocked" : task.status === "partially_completed" ? "run.partially_completed" : "run.failed", run_blocked: "run.blocked", xd_plan: "task.created", plan_generated: "todo.created", task_start: "todo.started", task_complete: "todo.completed", task_failed_item: "todo.failed", ssh: "tool.output", step: "task.updated", reply: "assistant.progress", done: "assistant.final", error: "tool.failed", stream_end: "stream.end" })[type] ?? `legacy.${type}`;
+    const eventType = ({ run_started: "run.started", run_completed: "run.completed", run_failed: task.status === "cancelled" ? "run.cancelled" : task.status === "blocked" ? "run.blocked" : task.status === "partially_completed" ? "run.partially_completed" : "run.failed", run_blocked: "run.blocked", xd_plan: "task.created", plan_generated: "todo.created", todo_discovered: "todo.created", target_context: "target.updated", task_start: "todo.started", task_complete: "todo.completed", task_failed_item: "todo.failed", ssh: "tool.output", step: "task.updated", reply: "assistant.progress", done: "assistant.final", error: "tool.failed", stream_end: "stream.end" })[type] ?? `legacy.${type}`;
     pool.query(
       `INSERT INTO agent_run_events(run_id,sequence,type,payload)
        SELECT $1,COALESCE(MAX(sequence),0)+1,$2,$3 FROM agent_run_events WHERE run_id=$1`,
@@ -112391,6 +112391,10 @@ async function rememberAgentFact({ userId, scopeType, scopeId, key, value, sourc
 }
 async function bridgeServerAgentRunStart(task, server, prompt) {
   if (!task.userId) return;
+  const promptText = String(prompt || "");
+  const repository = promptText.match(/https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)/i)?.[1]?.replace(/\.git$/i, "") ?? null;
+  const domain = promptText.match(/\b((?:[a-z0-9-]+\.)+[a-z]{2,})(?:\/|\b)/i)?.[1]?.toLowerCase() ?? null;
+  const targetContext = { targetType: server.cpanelUrl || Number(server.port) !== 22 ? "cpanel" : "vps", targetId: server.id, serverId: server.id, host: server.host, port: server.port, username: server.username, projectName: repository?.split("/").pop() ?? null, repository, domain };
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -112405,7 +112409,7 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
     await client.query("SELECT pg_advisory_xact_lock($1)", [conversationDbId]);
     const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1", [conversationDbId])).rows[0].n;
     const message = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,role,content,sequence,metadata) VALUES($1,$2,'user',$3,$4,$5) RETURNING id`, [randomUUID2(), conversationDbId, prompt, sequence, JSON.stringify({ source: "server-agent", serverId: server.id })]);
-    const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username })]);
+    const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username, targetContext })]);
     task.durableRunDbId = run.rows[0].id; task.durableConversationDbId = conversationDbId;
     await client.query("UPDATE conversation_messages SET run_id=$2 WHERE id=$1", [message.rows[0].id, task.durableRunDbId]);
     const taskItems = /\bdeploy|deployment|nginx|domain|ssl\b/i.test(String(prompt)) ? ["Connect to server", "Inspect current deployment", "Inspect repository and runtime", "Install, build, and start application", "Configure domain and TLS", "Verify production"] : ["Inspect server state", "Perform requested work", "Verify result", "Deliver final report"];
@@ -112455,6 +112459,50 @@ async function completeRunTask(task, evidence) {
     chatTaskEmit(task, "task_complete", { task: item.title, position: item.position });
     if (next.rowCount) chatTaskEmit(task, "task_start", { task: next.rows[0].title, position: next.rows[0].position });
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+}
+async function addRunTasks(task, titles, reason) {
+  if (!task?.durableTaskDbId || !Array.isArray(titles)) return [];
+  const clean = [...new Set(titles.map((title) => String(title).trim()).filter(Boolean))];
+  if (!clean.length) return [];
+  const client = await pool.connect(), added = [];
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT id FROM agent_tasks WHERE id=$1 FOR UPDATE", [task.durableTaskDbId]);
+    const existing = await client.query("SELECT lower(regexp_replace(title,'[^a-z0-9]+','','g')) normalized FROM agent_task_items WHERE task_id=$1", [task.durableTaskDbId]);
+    const keys = new Set(existing.rows.map((row) => row.normalized));
+    let position = Number((await client.query("SELECT COALESCE(MAX(position),0) n FROM agent_task_items WHERE task_id=$1", [task.durableTaskDbId])).rows[0].n);
+    for (const title of clean) {
+      const key = title.toLowerCase().replace(/[^a-z0-9]+/g, "");
+      if (keys.has(key)) continue;
+      position++;
+      await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence) VALUES($1,$2,$3,'pending',$4)", [task.durableTaskDbId, position, title, JSON.stringify({ discovered: true, reason })]);
+      keys.add(key); added.push({ title, position, status: "pending" });
+    }
+    await client.query("COMMIT");
+    if (added.length) chatTaskEmit(task, "todo_discovered", { reason, tasks: added, added: added.length });
+    return added;
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+}
+async function reconcileRunDiscoveries(task, output) {
+  const text = String(output || "");
+  const discovered = {};
+  const projectRoot = text.match(/(?:^|\s)(\/(?:var\/www|home|opt)\/[\w./-]+)/m)?.[1];
+  const appPort = text.match(/127\.0\.0\.1:(\d{2,5})/)?.[1];
+  const processName = text.match(/(?:pm2[^\n]*|name[^\n]*?)\b([a-z0-9][a-z0-9_-]*(?:airtel|starlink)[a-z0-9_-]*)\b/i)?.[1];
+  if (projectRoot) discovered.projectRoot = projectRoot.replace(/[,:;]+$/, "");
+  if (appPort) discovered.appPort = Number(appPort);
+  if (processName) discovered.processName = processName;
+  if (/\bpostgres(?:ql)?\b|@prisma\/adapter-pg|\bpg\b/i.test(text)) discovered.databaseType = "PostgreSQL";
+  else if (/\bmysql\b|\bmariadb\b/i.test(text)) discovered.databaseType = "MySQL/MariaDB";
+  if (Object.keys(discovered).length && task.durableRunDbId) {
+    await pool.query("UPDATE coding_agent_runs SET metadata=jsonb_set(metadata,'{targetContext}',COALESCE(metadata->'targetContext','{}'::jsonb)||$2::jsonb,true),updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify(discovered)]);
+    chatTaskEmit(task, "target_context", discovered);
+  }
+  if (/DATABASE_URL.{0,80}(?:must be set|missing|required)|did you forget to provision a database/i.test(text)) {
+    await addRunTasks(task, ["Inspect database requirements", "Provision isolated application database", "Configure application DATABASE_URL", "Run production-safe database migrations", "Restart application with database configuration", "Verify database-backed application health"], "Application database requirement detected");
+  }
+  if (/EADDRINUSE|address already in use|port is already allocated/i.test(text)) await addRunTasks(task, ["Select and configure a free application port"], "Configured application port is occupied");
+  if (/migration.{0,40}(?:pending|required|not applied)|relation .+ does not exist/i.test(text)) await addRunTasks(task, ["Inspect migration configuration", "Run production-safe database migrations"], "Pending database migration detected");
 }
 async function generateTaskTitle(task, summary) {
   const CATEGORIES = ["website", "bugfix", "deployment", "security", "vps", "email", "automation", "database", "api", "general"];
@@ -116171,6 +116219,7 @@ void (async () => {
         ...parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content }))
       ];
       aiMessages.push({ role: "user", content: `[REMOTE EXECUTION CONTRACT]\nYou are already connected through the owned server record (serverId ${s2.id}) and its saved ${s2.authType ?? "key"} credential. Every action=run command executes remotely through the backend SSH connection service. Never run ssh, sshpass, scp, sftp, or construct username@host authentication commands. Supply only the command that should execute on the connected server.` });
+      if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText)) aiMessages.push({ role: "user", content: `[DEPLOYMENT AUTONOMY]\nComplete discoverable, app-specific prerequisites instead of stopping at the first recoverable error. If DATABASE_URL is missing, inspect the repository's actual ORM/schema/migration configuration, identify the required database type, check the installed service, and—when safe—provision an isolated database and application user, configure the secret server-side without printing it, run the repository's real production-safe migration command, restart only the target process, and verify fresh logs plus a real application route. Never reuse, drop, truncate, or alter another project's database. PM2 online and curl --insecure are not proof of health: reconcile PID/port/latest logs and verify TLS normally. New requirements are added to the durable TODO automatically; continue unless an external prerequisite genuinely blocks execution.` });
       if (requestedDomain) aiMessages.push({ role: "user", content: `[DOMAIN TARGET BINDING]\nSSH execution target: ${s2.username}@${s2.host}:${s2.port}. Website target: https://${requestedDomain}${requestedWebPath}. These are different identities: the server IP can serve a default virtual host and an HTTP 403 from the raw IP does not mean the requested domain failed. The expected project root is /home/${s2.username}/${requestedDomain}; stay inside that root unless direct evidence proves a different document root. Search requested literals with grep -nF, not regex grep. Verify the hostname URL first; if DNS routing is unavailable, use curl --resolve ${requestedDomain}:443:${s2.host} https://${requestedDomain}${requestedWebPath}. A login redirect can be valid behavior. For a small source change, exact source/literal evidence plus the relevant syntax check is sufficient; a browser screenshot is optional and its absence must not force PARTIAL. Once the requested state and relevant verification pass, emit done immediately without extra discovery commands.` });
       if (simpleTaskFastPath) aiMessages.push({ role: "user", content: `[SIMPLE TASK FAST PATH]\nOriginal request (authoritative): ${userTaskText.slice(0, 1200)}\nExact target: ${explicitTargetMatch[1]}\nInspect this exact source file first. If the requested state already exists, do not edit it: run one relevant syntax check, verify the requested meaning, then finish. Otherwise make only the requested change, run one relevant syntax check, optionally perform at most one live visual check, then finish. Do not scan the project, read generated caches/vendor/node_modules, invent optional requirements, or restart planning.` });
       {
@@ -116326,6 +116375,7 @@ Tell the user to check that the agent script is still running in their terminal 
       const cmdRunCount = /* @__PURE__ */ new Map();
       const commandResultCount = /* @__PURE__ */ new Map();
       const commandResultCache = /* @__PURE__ */ new Map();
+      const unresolvedCommandFailures = /* @__PURE__ */ new Set();
       let mutationEpoch = 0;
       let budgetFinalizationRequested = false;
       const originalUserMessage = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
@@ -117114,11 +117164,13 @@ DO NOT repeat these commands again.`;
             const commandName = /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)grep(?:\s|$)/i.test(cmd) ? "grep" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)diff(?:\s|$)/i.test(cmd) ? "diff" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)(?:test|\[)(?:\s|$)/i.test(cmd) ? "test" : cmd.trim().match(/^(?:timeout\s+\d+\s+)?(?:env\s+\S+\s+)*([\w.-]+)/)?.[1]?.toLowerCase() ?? "";
             const toolClassification = result.code === 124 ? "COMMAND_TIMEOUT" : commandName === "grep" && result.code === 1 ? "NO_MATCH" : commandName === "grep" && result.code === 2 ? "TOOL_SYNTAX_ERROR" : commandName === "diff" && result.code === 1 ? "DIFFERENCES_FOUND" : commandName === "test" && result.code === 1 ? "CONDITION_FALSE" : result.code === 0 ? "SUCCESS" : "COMMAND_FAILURE";
             send2("cmd_done", { index: ci, code: result.code, classification: toolClassification });
-            if (toolClassification === "COMMAND_FAILURE") task.hadCommandFailure = true;
+            if (toolClassification === "COMMAND_FAILURE" || toolClassification === "COMMAND_TIMEOUT") unresolvedCommandFailures.add(normCmd(cmd));
+            else unresolvedCommandFailures.delete(normCmd(cmd));
             const rawOut = [
               result.stdout.trim(),
               result.stderr.trim() ? `[stderr] ${result.stderr.trim()}` : ""
             ].filter(Boolean).join("\n") || "(no output)";
+            await reconcileRunDiscoveries(task, rawOut);
             const trimLines = (s3, max = 20) => {
               const lines = s3.split("\n");
               if (lines.length <= max) return s3;
@@ -118204,7 +118256,15 @@ For each failure:
           const userTask = (parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "").toLowerCase();
           const doneMsg = action.message ?? "";
           const doneMsgLower = doneMsg.toLowerCase();
-          if (task.hadCommandFailure && !/status:\s*verified/i.test(doneMsgLower)) {
+          if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText) && task.durableTaskDbId) {
+            const remainingTodos = await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress') ORDER BY position", [task.durableTaskDbId]);
+            if (remainingTodos.rowCount && doneAttempts < 3) {
+              doneAttempts++;
+              aiMessages.push({ role: "assistant", content: raw }, { role: "user", content: `[DURABLE TODO GATE]\nThe run still has required work:\n${remainingTodos.rows.map((row) => `- ${row.title}`).join("\n")}\nContinue executing these recoverable deployment requirements. Do not return PARTIAL merely because a missing dependency, database configuration, port, process, vhost, or migration was discovered.` });
+              continue;
+            }
+          }
+          if (unresolvedCommandFailures.size > 0 && !/status:\s*verified/i.test(doneMsgLower)) {
             task.status = "partially_completed";
             action.message = `Partially completed.\n\n${doneMsg || "Some requested checks could not be completed."}\n\nVerification that could not be completed:\nOne or more server commands failed. Review the expandable execution log for details.`;
           }
@@ -119175,6 +119235,7 @@ router8.get("/:id/conversations/:conversationId", requireAuth, async (req, res) 
     (SELECT COUNT(*)::int FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id AND i.status='completed') completed_tasks,
     (SELECT COUNT(*)::int FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id) total_tasks,
     (SELECT i.title FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id AND i.status='in_progress' ORDER BY i.position LIMIT 1) current_step,
+    COALESCE((SELECT json_agg(json_build_object('id',i.id,'position',i.position,'title',i.title,'status',i.status,'evidence',i.evidence) ORDER BY i.position) FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id),'[]'::json) todo_items,
     GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(completed_at,NOW())-started_at))*1000)::bigint duration_ms,
     COALESCE((SELECT SUM(charged_credits) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0) credits_used
     FROM coding_agent_runs r WHERE conversation_id=$1 ORDER BY id DESC LIMIT 25`, [c.rows[0].id]);

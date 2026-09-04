@@ -97,3 +97,19 @@ test("timeouts are task-aware and distinct from generic failures", () => {
   assert.match(source, /result\.code === 124 \? "COMMAND_TIMEOUT"/);
   assert.match(source, /COMMAND_FAILURE\|COMMAND_TIMEOUT/);
 });
+
+test("discoveries expand the persisted TODO without duplicates", () => {
+  assert.match(source, /async function addRunTasks\(task, titles, reason\)/);
+  assert.match(source, /lower\(regexp_replace\(title/);
+  assert.match(source, /Application database requirement detected/);
+  assert.match(source, /Configure application DATABASE_URL/);
+  assert.match(source, /todo_discovered: "todo\.created"/);
+  assert.match(source, /\[DURABLE TODO GATE\]/);
+});
+
+test("run target context persists safe project metadata", () => {
+  assert.match(source, /const targetContext = \{ targetType:/);
+  assert.match(source, /target_context: "target\.updated"/);
+  assert.match(source, /databaseType = "PostgreSQL"/);
+  assert.match(source, /todo_items,/);
+});

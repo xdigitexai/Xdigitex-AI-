@@ -26,8 +26,8 @@ test("workspace supports history, new chat, follow-up, and inline persisted acti
 test("server cards route reliably and execution logs scroll independently", () => {
   assert.match(workspace, /body\.items\|\|body\.servers\|\|body\.data/);
   assert.match(workspace, /\/servers\/\$\{server\.id\}\/conversations/);
-  assert.match(workspace, /max-height:min\(400px,48vh\)/);
-  assert.match(workspace, /max-height:45vh/);
+  assert.match(workspace, /max-height:min\(300px,38vh\)/);
+  assert.match(workspace, /max-height:35vh/);
   assert.match(workspace, /New activity ↓/);
   assert.match(workspace, /CSS\.escape\(runId\)/);
   assert.match(workspace, /replace\(\/\\uFFFD\/g/);
@@ -43,4 +43,14 @@ test("execution details and long prompts are compact by default", () => {
   assert.match(workspace, /Open as \.txt/);
   assert.match(workspace, /task\.created/);
   assert.match(workspace, /cmd_results\|credits_used\|tokens/);
+});
+
+test("run card renders authoritative TODO and target context", () => {
+  assert.match(workspace, /function todoView\(r\)/);
+  assert.match(workspace, /r\.todo_items/);
+  assert.match(workspace, /HOSTING \/ CPANEL/);
+  assert.match(workspace, /Project:/);
+  assert.match(workspace, /Database:/);
+  assert.match(workspace, /event\.type==="todo\.created"/);
+  assert.match(workspace, /event\.type==="target\.updated"/);
 });
