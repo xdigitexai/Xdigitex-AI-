@@ -113000,6 +113000,7 @@ var CHAT_AGENT_SYSTEM = (username, historyLength = 1, githubToken, browserStatus
   const desktopBridgeLine = desktopConnected ? `
 \u{1F5A5}\uFE0F  DESKTOP BRIDGE: CONNECTED \u2014 the user's real local Chrome browser is LIVE.
 \u26A1 RULE: Use action="desktop_browser" when you need the user's real logged-in session (Gmail, cPanel UI, etc.).
+   For the user's local filesystem or terminal, use action="local_files" with operations [{type:"read|write",path,content?}] or action="local_terminal" with {command,cwd}. Inspect the Desktop Bridge platform first and never send Linux commands to Windows. Local and server paths are separate targets.
    Use action="browse" (Playwright headless) for screenshot verification of public URLs \u2014 it's faster and always available.
    If desktop_browser fails mid-task (bridge goes offline), the system auto-falls back to Playwright \u2014 you will receive results normally.
    desktop_browser steps: list_tabs | navigate url | click selector | type selector text | get_text selector? | screenshot | execute_js script
@@ -117470,6 +117471,29 @@ ALL BROWSER STEPS PASSED (${steps.length}/${steps.length}).`,
           ].join("\n");
           aiMessages.push({ role: "assistant", content: raw });
           aiMessages.push({ role: "user", content: fullBrowserContext });
+        } else if (action.action === "local_terminal" && action.command) {
+          if (!isConnected(s2.userId)) {
+            task.status = "blocked";
+            send2("reply", { text: "Blocked.\n\nReason:\nDesktop Bridge disconnected.\n\nReconnect the local computer to continue safely." });
+            break;
+          }
+          send2("think", { text: "Running command on connected local computer…" });
+          const localResult = await sendCommand(s2.userId, "terminal.run", { command: action.command, cwd: action.cwd }, 12e4);
+          aiMessages.push({ role: "assistant", content: raw });
+          aiMessages.push({ role: "user", content: `LOCAL TERMINAL RESULT (targetType=local,targetId=desktop_${s2.userId}):\n${JSON.stringify(redactSecrets(localResult)).slice(0, 12000)}` });
+        } else if (action.action === "local_files" && Array.isArray(action.operations) && action.operations.length) {
+          if (!isConnected(s2.userId)) {
+            task.status = "blocked";
+            send2("reply", { text: "Blocked.\n\nReason:\nDesktop Bridge disconnected.\n\nReconnect the local computer to continue safely." });
+            break;
+          }
+          const localResults = [];
+          for (const operation of action.operations.slice(0, 20)) {
+            if (operation.type === "read") localResults.push(await sendCommand(s2.userId, "file.read", { path: operation.path }, 3e4));
+            else if (operation.type === "write") localResults.push(await sendCommand(s2.userId, "file.write", { path: operation.path, content: operation.content ?? "" }, 3e4));
+          }
+          aiMessages.push({ role: "assistant", content: raw });
+          aiMessages.push({ role: "user", content: `LOCAL FILE RESULTS (targetType=local,targetId=desktop_${s2.userId}):\n${JSON.stringify(redactSecrets(localResults)).slice(0, 12000)}` });
         } else if (action.action === "desktop_browser" && Array.isArray(action.steps) && action.steps.length) {
           if (!isConnected(s2.userId)) {
             send2("think", { text: "\u26A0\uFE0F Desktop Bridge offline \u2014 falling back to Playwright Chromium for screenshots\u2026" });
@@ -123184,6 +123208,27 @@ router27.post("/browser/navigate", requireAuth, async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
   }
+});
+router27.post("/terminal/run", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], command = String(req.body?.command ?? ""), cwd = req.body?.cwd ? String(req.body.cwd) : void 0;
+  if (!command) return res.status(400).json({ error: "command required" });
+  if (!isConnected(userId)) return res.status(503).json({ error: "Desktop Bridge disconnected." });
+  try { return res.json({ targetType: "local", targetId: `desktop_${userId}`, result: await sendCommand(userId, "terminal.run", { command, cwd }, 12e4) }); }
+  catch (error) { return res.status(502).json({ error: String(error?.message ?? error), targetType: "local" }); }
+});
+router27.post("/files/read", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], path = String(req.body?.path ?? "");
+  if (!path) return res.status(400).json({ error: "path required" });
+  if (!isConnected(userId)) return res.status(503).json({ error: "Desktop Bridge disconnected." });
+  try { return res.json({ targetType: "local", targetId: `desktop_${userId}`, result: await sendCommand(userId, "file.read", { path }, 3e4) }); }
+  catch (error) { return res.status(502).json({ error: String(error?.message ?? error), targetType: "local" }); }
+});
+router27.post("/files/write", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], path = String(req.body?.path ?? ""), content = String(req.body?.content ?? "");
+  if (!path) return res.status(400).json({ error: "path required" });
+  if (!isConnected(userId)) return res.status(503).json({ error: "Desktop Bridge disconnected." });
+  try { return res.json({ targetType: "local", targetId: `desktop_${userId}`, result: await sendCommand(userId, "file.write", { path, content }, 3e4) }); }
+  catch (error) { return res.status(502).json({ error: String(error?.message ?? error), targetType: "local" }); }
 });
 router27.post("/browser/click", requireAuth, async (req, res) => {
   const userId = res.locals["userId"];
