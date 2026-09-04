@@ -9,7 +9,7 @@ import { serversTable } from "./servers";
 export const conversationStatusEnum = pgEnum("conversation_status", ["active", "archived"]);
 export const messageRoleEnum = pgEnum("conversation_message_role", ["user", "assistant", "system", "tool"]);
 export const runStatusEnum = pgEnum("agent_run_status", [
-  "queued", "running", "waiting", "completed", "failed", "cancelled", "insufficient_credits",
+  "queued", "planning", "running", "waiting_for_tool", "verifying", "completed", "partially_completed", "blocked", "failed", "cancelled", "insufficient_credits",
 ]);
 export const taskItemStatusEnum = pgEnum("agent_task_item_status", ["pending", "in_progress", "completed", "failed", "skipped"]);
 export const toolCallStatusEnum = pgEnum("agent_tool_call_status", ["queued", "running", "completed", "failed", "timeout", "cancelled", "waiting_approval"]);

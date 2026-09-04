@@ -45,6 +45,11 @@ export const serverTaskHistoryTable = pgTable("server_task_history", {
   totalTokens:      integer("total_tokens").notNull().default(0),
   iterations:       integer("iterations").notNull().default(0),
   durationMs:       integer("duration_ms").notNull().default(0),
+  creditsUsed:      integer("credits_used").notNull().default(0),
+  runId:            text("run_id"),
+  conversationId:   text("conversation_id"),
+  finalResponse:    text("final_response"),
+  steps:            text("steps"),
   createdAt:        timestamp("created_at").defaultNow().notNull(),
 });
 

@@ -4,7 +4,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { deploymentMigrations, LoopDetector, parseInfrastructureRequest } from "./deployment-runtime.mjs";
 
-export const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "insufficient_credits"]);
+export const TERMINAL_RUN_STATES = new Set(["completed", "partially_completed", "blocked", "failed", "cancelled", "insufficient_credits"]);
 export const RUN_TRANSITIONS = Object.freeze({
   queued: new Set(["running", "cancelled", "insufficient_credits"]),
   running: new Set(["waiting", "completed", "failed", "cancelled", "insufficient_credits"]),

@@ -97719,6 +97719,11 @@ var serverTaskHistoryTable = pgTable("server_task_history", {
   totalTokens: integer("total_tokens").notNull().default(0),
   iterations: integer("iterations").notNull().default(0),
   durationMs: integer("duration_ms").notNull().default(0),
+  creditsUsed: integer("credits_used").notNull().default(0),
+  runId: text("run_id"),
+  conversationId: text("conversation_id"),
+  finalResponse: text("final_response"),
+  steps: text("steps"),
   createdAt: timestamp("created_at").defaultNow().notNull()
 });
 var agentExperiencesTable = pgTable("agent_experiences", {
@@ -112256,6 +112261,11 @@ pool.query(`CREATE TABLE IF NOT EXISTS agent_runs (
   task_id VARCHAR(80)
 )`).catch(e => console.error('[agent_runs] table init:', e.message));
 pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT NOW()`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS credits_used INTEGER NOT NULL DEFAULT 0`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS run_id TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS conversation_id TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS final_response TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS steps TEXT`).catch(()=>{});
 setInterval(() => {
   const cutoff = Date.now() - 4 * 60 * 60 * 1e3;
   for (const [id, task] of chatTaskStore) {
@@ -112268,9 +112278,9 @@ setInterval(() => {
 var TIMELINE_TYPES = /* @__PURE__ */ new Set(["think", "ssh", "browse", "step", "reply", "error"]);
 function chatTaskEmit(task, type, payload) {
   task.eventBuffer.push({ type, payload });
-  if (type === "reply" && payload?.text) task.lastReply = payload.text;
+  if ((type === "reply" || type === "done") && payload?.text) task.lastReply = payload.text;
   if (task?.durableRunDbId) {
-    const eventType = ({ run_started: "run.started", run_completed: "run.completed", run_failed: task.status === "cancelled" ? "run.cancelled" : "run.failed", xd_plan: "task.created", ssh: "tool.output", step: "task.updated", reply: "assistant.progress", error: "tool.failed", stream_end: "stream.end" })[type] ?? `legacy.${type}`;
+    const eventType = ({ run_started: "run.started", run_completed: "run.completed", run_failed: task.status === "cancelled" ? "run.cancelled" : task.status === "blocked" ? "run.blocked" : task.status === "partially_completed" ? "run.partially_completed" : "run.failed", run_blocked: "run.blocked", xd_plan: "task.created", plan_generated: "todo.created", task_start: "todo.started", task_complete: "todo.completed", task_failed_item: "todo.failed", ssh: "tool.output", step: "task.updated", reply: "assistant.progress", done: "assistant.final", error: "tool.failed", stream_end: "stream.end" })[type] ?? `legacy.${type}`;
     pool.query(
       `INSERT INTO agent_run_events(run_id,sequence,type,payload)
        SELECT $1,COALESCE(MAX(sequence),0)+1,$2,$3 FROM agent_run_events WHERE run_id=$1`,
@@ -112292,6 +112302,48 @@ function chatTaskEmit(task, type, payload) {
       task.lastAction = text2;
     }
   }
+}
+async function reserveServerAgentCredits(task, provider, model, iteration) {
+  const client = await pool.connect();
+  const key = `${task.runId}:model:${iteration}`;
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query("SELECT * FROM agent_usage_ledger WHERE idempotency_key=$1", [key]);
+    if (existing.rowCount) { await client.query("COMMIT"); return existing.rows[0]; }
+    const user = await client.query("SELECT credits FROM users WHERE id=$1 FOR UPDATE", [task.userId]);
+    const before = Number(user.rows[0]?.credits ?? 0);
+    if (before <= 0) { await client.query("ROLLBACK"); return null; }
+    await client.query("UPDATE users SET credits=credits-1,updated_at=NOW() WHERE id=$1 AND credits>0", [task.userId]);
+    const ledger = await client.query(`INSERT INTO agent_usage_ledger(public_id,user_id,conversation_id,run_id,provider,model,reserved_credits,balance_before,balance_after,status,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,1,$7,$8,'reserved',$9) RETURNING *`, [randomUUID2(), task.userId, task.durableConversationDbId, task.durableRunDbId, provider, model, before, before - 1, key]);
+    await client.query("COMMIT");
+    return ledger.rows[0];
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+}
+async function settleServerAgentCredits(task, ledger, usage, provider, model) {
+  if (!ledger || ledger.status === "settled") return ledger;
+  const inputTokens = Number(usage?.prompt_tokens ?? 0), outputTokens = Number(usage?.completion_tokens ?? 0);
+  const deepseek = /deepseek/i.test(`${provider} ${model}`), luna = /luna|gpt-5\.6/i.test(model);
+  const inputPrice = deepseek ? 0.27 : luna ? 0.20 : 0.55;
+  const outputPrice = deepseek ? 1.10 : luna ? 1.20 : 2.19;
+  const providerCost = (inputTokens * inputPrice + outputTokens * outputPrice) / 1e6;
+  const requestedCredits = Math.max(1, Math.ceil(providerCost * 800));
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query("SELECT * FROM agent_usage_ledger WHERE id=$1 FOR UPDATE", [ledger.id]);
+    if (locked.rows[0]?.status === "settled") { await client.query("COMMIT"); return locked.rows[0]; }
+    const user = await client.query("SELECT credits FROM users WHERE id=$1 FOR UPDATE", [task.userId]);
+    const available = Number(user.rows[0]?.credits ?? 0);
+    const extra = Math.min(Math.max(0, requestedCredits - 1), available);
+    if (extra > 0) await client.query("UPDATE users SET credits=credits-$2,updated_at=NOW() WHERE id=$1", [task.userId, extra]);
+    const charged = 1 + extra, after = available - extra;
+    const row = await client.query(`UPDATE agent_usage_ledger SET provider=$2,model=$3,input_tokens=$4,output_tokens=$5,provider_cost=$6,charged_credits=$7,balance_after=$8,status='settled',updated_at=NOW() WHERE id=$1 RETURNING *`, [ledger.id, provider, model, inputTokens, outputTokens, providerCost, charged, after]);
+    await client.query("COMMIT");
+    task.creditsUsed = (task.creditsUsed ?? 0) + charged;
+    if (charged < requestedCredits || after <= 0) task.creditExhausted = true;
+    chatTaskEmit(task, "credits_used", { creditsUsed: task.creditsUsed, balance: after });
+    return row.rows[0];
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 }
 async function bridgeServerAgentRunStart(task, server, prompt) {
   if (!task.userId) return;
@@ -112322,8 +112374,10 @@ async function bridgeServerAgentRunFinish(task) {
   if (!task.durableRunDbId) return;
   const failed = task.status === "failed" || task.status === "error";
   const cancelled = task.status === "cancelled";
-  const status = cancelled ? "cancelled" : failed ? "failed" : "completed";
-  const finalText = task.lastReply || (cancelled ? "Task cancelled. Completed work was preserved and the conversation remains available." : failed ? "The task failed after recovery attempts. Review the run timeline for the final error." : "Task completed. Review the run timeline for actions and verification evidence.");
+  const blocked = task.status === "blocked";
+  const partial = task.status === "partially_completed";
+  const status = cancelled ? "cancelled" : blocked ? "blocked" : partial ? "partially_completed" : failed ? "failed" : "completed";
+  const finalText = task.lastReply || (cancelled ? "Cancelled. Completed work was preserved and the conversation remains available." : blocked ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : partial ? "Partially completed. Review the completed work and outstanding verification in Task History." : failed ? "Failed. The task stopped after bounded recovery attempts. Review Task History for the final error." : "Completed. Review Task History for actions and verification evidence.");
   const client = await pool.connect();
   try { await client.query("BEGIN");
     await client.query("UPDATE coding_agent_runs SET status=$2,phase=$2,heartbeat_at=NOW(),completed_at=NOW(),lock_token=NULL,updated_at=NOW(),error=CASE WHEN $2='failed' THEN $3 ELSE error END WHERE id=$1", [task.durableRunDbId, status, failed ? finalText : null]);
@@ -116081,7 +116135,7 @@ Tell the user to check that the agent script is still running in their terminal 
           durationMs
         });
         const userTask = parsed.data.messages[parsed.data.messages.length - 1]?.content?.slice(0, 1e3) ?? "";
-        const taskStatus = task.status === "failed" ? "failed" : task.status === "cancelled" ? "cancelled" : "completed";
+        const taskStatus = ["failed", "cancelled", "blocked", "partially_completed"].includes(task.status) ? task.status : "completed";
         const [inserted] = await db.insert(serverTaskHistoryTable).values({
           serverId: s2.id,
           task: userTask,
@@ -116092,6 +116146,11 @@ Tell the user to check that the agent script is still running in their terminal 
           totalTokens: total,
           iterations: totalIterations,
           durationMs,
+          creditsUsed: task.creditsUsed ?? 0,
+          runId: task.runId,
+          conversationId: task.conversationId,
+          finalResponse: summary?.slice(0, 8e3) ?? "",
+          steps: JSON.stringify(planState ?? {}),
           status: taskStatus,
           lastAction: task.lastAction?.slice(0, 300) ?? "",
           timeline: JSON.stringify(task.timeline.slice(-50)),
@@ -116253,11 +116312,13 @@ Tell the user to check that the agent script is still running in their terminal 
         }
         let iterModel = baseModel;
         let iterClient = getAIClient(baseProvider);
+        let iterProvider = baseProvider;
         if (_openaiReliefRemaining > 0 && process.env["OPENAI_API_KEY"]) {
           _openaiReliefRemaining--;
           const _relief = cheapOpenAIModel();
           iterModel = _relief.model;
           iterClient = getAIClient("openai");
+          iterProvider = "openai";
         }
         if (isAuto) {
           const prevRole = currentRole;
@@ -116293,7 +116354,8 @@ Tell the user to check that the agent script is still running in their terminal 
             }
           }
           iterModel = autoModel(currentRole);
-          iterClient = getAIClient(autoProvider(currentRole));
+          iterProvider = autoProvider(currentRole);
+          iterClient = getAIClient(iterProvider);
           if (currentRole !== prevRole || iter === 0) {
             const roleLabel = {
               task_manager: "PLANNING",
@@ -116657,7 +116719,16 @@ After fixing, verify the file works, then action="done".`
           });
           send2("think", { text: `\u26A0\uFE0F Step limit approaching (iter ${iter}/80) \u2014 wrap-up signal injected` });
         }
+        const creditLedger = await reserveServerAgentCredits(task, iterProvider, iterModel, iter + 1);
+        if (!creditLedger) {
+          task.status = "blocked";
+          const blockedText = "Blocked.\n\nReason:\nInsufficient credits.\n\nPlease add credits to continue using the AI Coding Agent.";
+          send2("reply", { text: blockedText });
+          send2("run_blocked", { runId: task.runId, conversationId: task.conversationId, status: "blocked", reason: "Insufficient credits" });
+          break;
+        }
         const completion = await callWithRetry();
+        await settleServerAgentCredits(task, creditLedger, completion.usage, iterProvider, iterModel);
         if (completion.usage) {
           totalPromptTokens += completion.usage.prompt_tokens ?? 0;
           totalCompletionTokens += completion.usage.completion_tokens ?? 0;
@@ -116850,6 +116921,12 @@ DO NOT repeat these commands again.`;
             };
           });
           for (let ci = 0; ci < cmds.length; ci++) {
+            if (task.creditExhausted) {
+              task.status = "blocked";
+              send2("reply", { text: "Blocked.\n\nReason:\nInsufficient credits.\n\nCompleted work has been preserved. Please add credits to continue using the AI Coding Agent." });
+              send2("run_blocked", { runId: task.runId, conversationId: task.conversationId, status: "blocked", reason: "Insufficient credits" });
+              break;
+            }
             let { cmd, desc: desc3 } = cmds[ci];
             const destructive = DESTRUCTIVE_PATTERNS.find(({ re }) => re.test(cmd));
             if (destructive) {
@@ -116899,11 +116976,13 @@ ${kept.join("\n")}`;
 ${out}
 [exit ${result.code}]`);
           }
-          // Mid-task credit check
+          if (task.status === "blocked") break;
+          // Mid-task credit check before another model/tool cycle.
           const [_midCr] = await db.select({ credits: usersTable.credits }).from(usersTable).where(eq(usersTable.id, s2.userId));
           if (!_midCr || _midCr.credits <= 0) {
-            send2("reply", { text: "⏸️ Task suspended — credits exhausted. Please top up to continue." });
-            return res.end();
+            task.status = "blocked";
+            send2("reply", { text: "Blocked.\n\nReason:\nInsufficient credits.\n\nCompleted work has been preserved. Please add credits to continue using the AI Coding Agent." });
+            break;
           }
           const resultText = cmdResults.join("\n\n\u2500\u2500\u2500\u2500\u2500\n\n");
           aiMessages.push({ role: "assistant", content: raw });
@@ -118166,7 +118245,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
       await flushTokens("Max iterations reached").catch(() => {
       });
     } catch (err) {
-      task.status = "failed";
+      if (task.status !== "blocked" && task.status !== "cancelled") task.status = "failed";
       const rawMsg = String(err instanceof Error ? err.message : err);
       const userMsg = (() => {
         const m2 = rawMsg.toLowerCase();
@@ -118178,19 +118257,21 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
         return rawMsg;
       })();
       send2("error", { text: userMsg });
+      if (!task.lastReply) send2("reply", { text: `Failed.\n\nReason:\n${userMsg}\n\nCompleted work, if any, has been preserved.` });
       notifyTaskComplete(task, "", true).catch(() => {
       });
     } finally {
       if (task.status === "running") task.status = "completed";
+      if (!task.lastReply) chatTaskEmit(task, "reply", { text: task.status === "completed" ? "Completed. The requested work finished; see Task History for the recorded actions and verification." : task.status === "cancelled" ? "Cancelled. Completed work was preserved." : task.status === "blocked" ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : "Failed. The task stopped after bounded recovery attempts." });
       // Emit lifecycle event + persist to DB
       try {
-        const _runFailed = task.status === "failed" || task.status === "error" || task.status === "cancelled";
-        const _runEvt = _runFailed ? "run_failed" : "run_completed";
+        const _runFailed = task.status === "failed" || task.status === "error" || task.status === "cancelled" || task.status === "blocked" || task.status === "partially_completed";
+        const _runEvt = task.status === "blocked" ? "run_blocked" : _runFailed ? "run_failed" : "run_completed";
         chatTaskEmit(task, _runEvt, { runId: task.runId, conversationId: task.conversationId, status: task.status });
         if (task.runId) {
           pool.query(
             `UPDATE agent_runs SET status=$1, phase=$2, completed_at=NOW() WHERE run_id=$3`,
-            [task.status, _runFailed ? "failed" : "completed", task.runId]
+            [task.status, task.status, task.runId]
           ).catch(() => {});
           pool.query(
             `UPDATE agent_conversations SET updated_at=NOW() WHERE conversation_id=$1`,
@@ -118215,8 +118296,10 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
     }
   })();
 });
-router8.get("/:id/tasks", (req, res) => {
+router8.get("/:id/tasks", requireAuth, async (req, res) => {
   const serverId = parseInt(req.params["id"] ?? "0");
+  const owned = await pool.query("SELECT id FROM servers WHERE id=$1 AND user_id=$2", [serverId, res.locals["userId"]]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Not found" });
   const tasks = [...chatTaskStore.values()].filter((t2) => t2.serverId === serverId).map((t2) => ({
     id: t2.id,
     status: t2.status,
@@ -118238,14 +118321,17 @@ router8.get("/:id/runs/:runId", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "DB error" });
   }
 });
-router8.get("/:id/tasks/:taskId/events", async (req, res) => {
+router8.get("/:id/tasks/:taskId/events", requireAuth, async (req, res) => {
   const task = chatTaskStore.get(req.params["taskId"] ?? "");
+  const serverId = parseInt(req.params["id"] ?? "0");
+  const owned = await pool.query("SELECT id FROM servers WHERE id=$1 AND user_id=$2", [serverId, res.locals["userId"]]);
+  if (!owned.rowCount || (task && task.serverId !== serverId)) return res.status(404).json({ error: "Not found" });
   if (!task) {
     // Check DB: if run was completed, send stream_end so UI unlocks instead of staying stuck
     try {
       const _dbRun = await pool.query(
-        `SELECT status FROM agent_runs WHERE task_id=$1 LIMIT 1`,
-        [req.params["taskId"]]
+        `SELECT status FROM agent_runs WHERE task_id=$1 AND server_id=$2 AND user_id=$3 LIMIT 1`,
+        [req.params["taskId"], serverId, res.locals["userId"]]
       );
       if (_dbRun.rows.length && _dbRun.rows[0].status !== "running") {
         const _st = _dbRun.rows[0].status;
@@ -118307,9 +118393,9 @@ router8.get("/:id/tasks/:taskId/events", async (req, res) => {
     task.subscribers.delete(sub);
   });
 });
-router8.post("/:id/tasks/:taskId/approve", (req, res) => {
+router8.post("/:id/tasks/:taskId/approve", requireAuth, (req, res) => {
   const task = chatTaskStore.get(req.params["taskId"] ?? "");
-  if (!task) {
+  if (!task || task.serverId !== parseInt(req.params["id"] ?? "0") || task.userId !== res.locals["userId"]) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
@@ -118323,14 +118409,15 @@ router8.post("/:id/tasks/:taskId/approve", (req, res) => {
   chatTaskEmit(task, "think", { text: (approved !== false) ? "\u2705 Command approved \u2014 executing now\u2026" : "\uD83D\uDEAB Command rejected \u2014 skipping." });
   return res.json({ ok: true });
 });
-router8.post("/:id/tasks/:taskId/cancel", (req, res) => {
+router8.post("/:id/tasks/:taskId/cancel", requireAuth, (req, res) => {
   const task = chatTaskStore.get(req.params["taskId"] ?? "");
-  if (!task) {
+  if (!task || task.serverId !== parseInt(req.params["id"] ?? "0") || task.userId !== res.locals["userId"]) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
   task.abort.abort();
   task.status = "cancelled";
+  chatTaskEmit(task, "reply", { text: "Cancelled. Completed work was preserved and this chat is ready for another request." });
   try {
     chatTaskEmit(task, "run_failed", { runId: task.runId, conversationId: task.conversationId, status: "cancelled", reason: "User cancelled" });
     if (task.runId) pool.query(`UPDATE agent_runs SET status='cancelled', completed_at=NOW() WHERE run_id=$1`, [task.runId]).catch(() => {});
