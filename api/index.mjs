@@ -97719,6 +97719,11 @@ var serverTaskHistoryTable = pgTable("server_task_history", {
   totalTokens: integer("total_tokens").notNull().default(0),
   iterations: integer("iterations").notNull().default(0),
   durationMs: integer("duration_ms").notNull().default(0),
+  creditsUsed: integer("credits_used").notNull().default(0),
+  runId: text("run_id"),
+  conversationId: text("conversation_id"),
+  finalResponse: text("final_response"),
+  steps: text("steps"),
   createdAt: timestamp("created_at").defaultNow().notNull()
 });
 var agentExperiencesTable = pgTable("agent_experiences", {
@@ -98354,6 +98359,10 @@ async function requireAuth(req, res, next) {
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
+  if (user.status !== "active") {
+    res.status(403).json({ error: "Account is suspended or disabled" });
+    return;
+  }
   res.locals["userId"] = user.id;
   res.locals["user"] = user;
   res.locals["token"] = req.headers.authorization?.slice(7) ?? "";
@@ -98389,13 +98398,21 @@ router2.post("/login", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
   const { email: email3 } = parsed.data;
   const [user] = await db.select().from(usersTable).where(eq(usersTable.email, email3));
-  if (!user) return res.status(401).json({ error: "Invalid credentials" });
+  if (!user) {
+    recordLoginAttempt(pool, req, { identifier: email3, success: false, failure: "invalid_credentials" }).catch(() => {});
+    return res.status(401).json({ error: "Invalid credentials" });
+  }
+  if (user.status !== "active") {
+    recordLoginAttempt(pool, req, { userId: user.id, identifier: email3, success: false, failure: "account_restricted" }).catch(() => {});
+    return res.status(403).json({ error: "Account is suspended or disabled" });
+  }
   const { passwordHash: _, ...safeUser } = user;
   const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ?? req.socket.remoteAddress ?? void 0;
   const ua = req.headers["user-agent"] ?? void 0;
   sendLoginNotification({ to: email3, name: user.name, ip, userAgent: ua }).catch(
     (err) => req.log?.warn({ err }, "Failed to send login notification email")
   );
+  recordLoginAttempt(pool, req, { userId: user.id, identifier: email3, success: true, sessionRef: `mock-token-${user.id}` }).catch(() => {});
   return res.json({ user: safeUser, token: `mock-token-${user.id}` });
 });
 router2.get("/me", async (req, res) => {
@@ -109186,7 +109203,7 @@ var import_multer = __toESM(require_multer(), 1);
 import path3 from "path";
 
 // src/lib/memory.ts
-async function searchExperiences(query, limit2 = 4) {
+async function searchExperiences(query, limit2 = 4, serverId = null) {
   if (!query.trim()) return [];
   const words = query.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((w) => w.length > 3).slice(0, 10);
   if (words.length === 0) return [];
@@ -109197,8 +109214,12 @@ async function searchExperiences(query, limit2 = 4) {
       or lower(${agentExperiencesTable.category}) like ${"%" + w + "%"})`
   );
   try {
-    const rows = await db.select().from(agentExperiencesTable).where(sql`${likeConditions.reduce((a, b) => sql`${a} or ${b}`)}`).orderBy(desc(agentExperiencesTable.score), desc(agentExperiencesTable.successCount)).limit(limit2);
-    return rows;
+    const rows = await db.select().from(agentExperiencesTable).where(sql`(${likeConditions.reduce((a, b) => sql`${a} or ${b}`)}) AND ${agentExperiencesTable.score} >= 70 AND (${agentExperiencesTable.serverId} IS NULL OR ${agentExperiencesTable.serverId} = ${serverId})`).orderBy(desc(agentExperiencesTable.score), desc(agentExperiencesTable.successCount)).limit(limit2 * 3);
+    const queryWords = new Set(words);
+    return rows.filter((row) => {
+      const haystack = `${row.keywords ?? ""} ${row.problem ?? ""} ${row.category ?? ""}`.toLowerCase();
+      return [...queryWords].filter((word) => haystack.includes(word)).length >= 2;
+    }).slice(0, limit2);
   } catch {
     return [];
   }
@@ -112231,6 +112252,16 @@ function trackFileWrites(cmd, task) {
   }
 }
 var chatTaskStore = /* @__PURE__ */ new Map();
+function conciseConversationTitle(value) {
+  const clean = String(value || "New chat").replace(/[`*_#>\[\]()]/g, " ").replace(/\s+/g, " ").trim();
+  const domain = clean.match(/(?:on\s+)?([a-z0-9-]+)\.(?:com|site|online|net|org|io|co)\b/i)?.[1];
+  const name = domain ? domain.charAt(0).toUpperCase() + domain.slice(1) : "";
+  if (domain && /invite|referral|refer/i.test(clean)) return `${name} referral promo`;
+  if (domain && /cron|schedule/i.test(clean)) return `Fix ${name} cron`;
+  if (domain && /deploy/i.test(clean)) return `Deploy ${name}`;
+  const short = clean.replace(/^(?:please\s+)?(?:on\s+)?/i, "").slice(0, 56).trim();
+  return short || "New chat";
+}
 // ── Persistent conversation + run tables ────────────────────────────────────
 pool.query(`CREATE TABLE IF NOT EXISTS agent_conversations (
   id SERIAL PRIMARY KEY,
@@ -112256,6 +112287,20 @@ pool.query(`CREATE TABLE IF NOT EXISTS agent_runs (
   task_id VARCHAR(80)
 )`).catch(e => console.error('[agent_runs] table init:', e.message));
 pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT NOW()`).catch(()=>{});
+pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP`).catch(()=>{});
+pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP DEFAULT NOW()`).catch(()=>{});
+pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS current_step TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMP`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS credits_used INTEGER NOT NULL DEFAULT 0`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS run_id TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS conversation_id TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS final_response TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS steps TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS client_message_id TEXT`).catch(()=>{});
+pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_client_unique ON conversation_messages(conversation_id,client_message_id) WHERE client_message_id IS NOT NULL`).catch(()=>{});
+pool.query(`CREATE TABLE IF NOT EXISTS agent_message_idempotency (conversation_id TEXT NOT NULL,user_id INTEGER NOT NULL,server_id INTEGER NOT NULL,client_message_id TEXT NOT NULL,run_id TEXT,task_id TEXT,created_at TIMESTAMP DEFAULT NOW(),PRIMARY KEY(conversation_id,client_message_id))`).catch(()=>{});
+pool.query(`CREATE INDEX IF NOT EXISTS conversations_server_last_idx ON conversations(server_id,last_message_at DESC)`).catch(()=>{});
 setInterval(() => {
   const cutoff = Date.now() - 4 * 60 * 60 * 1e3;
   for (const [id, task] of chatTaskStore) {
@@ -112268,7 +112313,20 @@ setInterval(() => {
 var TIMELINE_TYPES = /* @__PURE__ */ new Set(["think", "ssh", "browse", "step", "reply", "error"]);
 function chatTaskEmit(task, type, payload) {
   task.eventBuffer.push({ type, payload });
+  if ((type === "reply" || type === "done") && payload?.text) task.lastReply = payload.text;
+  if (task?.durableRunDbId) {
+    const eventType = ({ run_started: "run.started", run_completed: "run.completed", run_failed: task.status === "cancelled" ? "run.cancelled" : task.status === "blocked" ? "run.blocked" : task.status === "partially_completed" ? "run.partially_completed" : "run.failed", run_blocked: "run.blocked", xd_plan: "task.created", plan_generated: "todo.created", task_start: "todo.started", task_complete: "todo.completed", task_failed_item: "todo.failed", ssh: "tool.output", step: "task.updated", reply: "assistant.progress", done: "assistant.final", error: "tool.failed", stream_end: "stream.end" })[type] ?? `legacy.${type}`;
+    pool.query(
+      `INSERT INTO agent_run_events(run_id,sequence,type,payload)
+       SELECT $1,COALESCE(MAX(sequence),0)+1,$2,$3 FROM agent_run_events WHERE run_id=$1`,
+      [task.durableRunDbId, eventType, JSON.stringify(redactSecrets(payload ?? {}))]
+    ).catch(() => {});
+  }
   if (task && type !== "heartbeat") task.lastEmitAt = Date.now();
+  if (task?.runId && type !== "heartbeat") {
+    const currentStep = ["think", "step", "task_start", "status"].includes(type) ? String(payload?.text ?? payload?.task ?? payload?.value ?? "").slice(0, 300) : null;
+    pool.query("UPDATE agent_runs SET heartbeat_at=NOW(),current_step=COALESCE($2,current_step) WHERE run_id=$1", [task.runId, currentStep]).catch(() => {});
+  }
   for (const sub of [...task.subscribers]) {
     try {
       sub(type, payload);
@@ -112283,6 +112341,103 @@ function chatTaskEmit(task, type, payload) {
       task.lastAction = text2;
     }
   }
+}
+async function reserveServerAgentCredits(task, provider, model, iteration) {
+  const client = await pool.connect();
+  const key = `${task.runId}:model:${iteration}`;
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query("SELECT * FROM agent_usage_ledger WHERE idempotency_key=$1", [key]);
+    if (existing.rowCount) { await client.query("COMMIT"); return existing.rows[0]; }
+    const user = await client.query("SELECT credits FROM users WHERE id=$1 FOR UPDATE", [task.userId]);
+    const before = Number(user.rows[0]?.credits ?? 0);
+    if (before <= 0) { await client.query("ROLLBACK"); return null; }
+    await client.query("UPDATE users SET credits=credits-1,updated_at=NOW() WHERE id=$1 AND credits>0", [task.userId]);
+    const ledger = await client.query(`INSERT INTO agent_usage_ledger(public_id,user_id,conversation_id,run_id,provider,model,reserved_credits,balance_before,balance_after,status,idempotency_key) VALUES($1,$2,$3,$4,$5,$6,1,$7,$8,'reserved',$9) RETURNING *`, [randomUUID2(), task.userId, task.durableConversationDbId, task.durableRunDbId, provider, model, before, before - 1, key]);
+    await client.query("COMMIT");
+    return ledger.rows[0];
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+}
+async function settleServerAgentCredits(task, ledger, usage, provider, model) {
+  if (!ledger || ledger.status === "settled") return ledger;
+  const inputTokens = Number(usage?.prompt_tokens ?? 0), outputTokens = Number(usage?.completion_tokens ?? 0);
+  const deepseek = /deepseek/i.test(`${provider} ${model}`), luna = /luna|gpt-5\.6/i.test(model);
+  const inputPrice = deepseek ? 0.27 : luna ? 0.20 : 0.55;
+  const outputPrice = deepseek ? 1.10 : luna ? 1.20 : 2.19;
+  const providerCost = (inputTokens * inputPrice + outputTokens * outputPrice) / 1e6;
+  const requestedCredits = Math.max(1, Math.ceil(providerCost * 800));
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const locked = await client.query("SELECT * FROM agent_usage_ledger WHERE id=$1 FOR UPDATE", [ledger.id]);
+    if (locked.rows[0]?.status === "settled") { await client.query("COMMIT"); return locked.rows[0]; }
+    const user = await client.query("SELECT credits FROM users WHERE id=$1 FOR UPDATE", [task.userId]);
+    const available = Number(user.rows[0]?.credits ?? 0);
+    const extra = Math.min(Math.max(0, requestedCredits - 1), available);
+    if (extra > 0) await client.query("UPDATE users SET credits=credits-$2,updated_at=NOW() WHERE id=$1", [task.userId, extra]);
+    const charged = 1 + extra, after = available - extra;
+    const row = await client.query(`UPDATE agent_usage_ledger SET provider=$2,model=$3,input_tokens=$4,output_tokens=$5,provider_cost=$6,charged_credits=$7,balance_after=$8,status='settled',updated_at=NOW() WHERE id=$1 RETURNING *`, [ledger.id, provider, model, inputTokens, outputTokens, providerCost, charged, after]);
+    await client.query("COMMIT");
+    task.creditsUsed = (task.creditsUsed ?? 0) + charged;
+    if (charged < requestedCredits || after <= 0) task.creditExhausted = true;
+    chatTaskEmit(task, "credits_used", { creditsUsed: task.creditsUsed, balance: after });
+    return row.rows[0];
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+}
+async function rememberAgentFact({ userId, scopeType, scopeId, key, value, source, confidence = 1 }) {
+  const serialized = JSON.stringify(value);
+  if (/(password|private.?key|api.?key|secret|bearer|credit.?card)/i.test(`${key} ${serialized}`)) return;
+  await pool.query(`INSERT INTO agent_scoped_memory(user_id,scope_type,scope_id,key,value,source,confidence,last_verified_at) VALUES($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT(user_id,scope_type,scope_id,key) DO UPDATE SET value=EXCLUDED.value,source=EXCLUDED.source,confidence=EXCLUDED.confidence,last_verified_at=NOW(),updated_at=NOW()`, [userId, scopeType, String(scopeId), key, serialized, source, confidence]);
+}
+async function bridgeServerAgentRunStart(task, server, prompt) {
+  if (!task.userId) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const conversation = await client.query(
+      `INSERT INTO conversations(public_id,user_id,title,server_id,status,metadata,last_message_at)
+       VALUES($1,$2,$3,$4,'active',$5,NOW())
+       ON CONFLICT(public_id) DO UPDATE SET server_id=EXCLUDED.server_id,last_message_at=NOW(),updated_at=NOW()
+       RETURNING id`,
+      [task.conversationId, task.userId, String(prompt || "Server task").slice(0, 80), server.id, JSON.stringify({ source: "server-agent", serverName: server.name, host: server.host, port: server.port, username: server.username })]
+    );
+    const conversationDbId = conversation.rows[0].id;
+    await client.query("SELECT pg_advisory_xact_lock($1)", [conversationDbId]);
+    const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1", [conversationDbId])).rows[0].n;
+    const message = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,role,content,sequence,metadata) VALUES($1,$2,'user',$3,$4,$5) RETURNING id`, [randomUUID2(), conversationDbId, prompt, sequence, JSON.stringify({ source: "server-agent", serverId: server.id })]);
+    const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username })]);
+    task.durableRunDbId = run.rows[0].id; task.durableConversationDbId = conversationDbId;
+    await client.query("UPDATE conversation_messages SET run_id=$2 WHERE id=$1", [message.rows[0].id, task.durableRunDbId]);
+    const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify([{ title: "Inspect server state", required: true }, { title: "Perform requested work", required: true }, { title: "Verify result", required: true }, { title: "Deliver final report", required: true }]), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true })]);
+    task.durableTaskDbId = plan.rows[0].id;
+    for (const [position, title] of ["Inspect server state", "Perform requested work", "Verify result", "Deliver final report"].entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status) VALUES($1,$2,$3,$4)", [task.durableTaskDbId, position + 1, title, position === 0 ? "in_progress" : "pending"]);
+    await client.query("COMMIT");
+    await Promise.all([
+      rememberAgentFact({ userId: task.userId, scopeType: "user", scopeId: task.userId, key: "operating_preferences", value: { preferFreePorts: true, preserveSshConfiguration: true, restartOnlyTargetProcess: true, verifyBeforeCompletion: true, exactDomainIsolation: true, targetedFileReading: true }, source: "system_policy", confidence: 1 }),
+      rememberAgentFact({ userId: task.userId, scopeType: "server", scopeId: server.id, key: "identity", value: { serverId: server.id, name: server.name, host: server.host, port: server.port, username: server.username, credentialRef: `server_${server.id}` }, source: "connected_server_record", confidence: 1 })
+    ]);
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+}
+async function bridgeServerAgentRunFinish(task) {
+  if (!task.durableRunDbId) return;
+  const failed = task.status === "failed" || task.status === "error";
+  const cancelled = task.status === "cancelled";
+  const blocked = task.status === "blocked";
+  const partial = task.status === "partially_completed";
+  const status = cancelled ? "cancelled" : blocked ? "blocked" : partial ? "partially_completed" : failed ? "failed" : "completed";
+  const finalText = task.lastReply || (cancelled ? "Cancelled. Completed work was preserved and the conversation remains available." : blocked ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : partial ? "Partially completed. Review the completed work and outstanding verification in Task History." : failed ? "Failed. The task stopped after bounded recovery attempts. Review Task History for the final error." : "Completed. Review Task History for actions and verification evidence.");
+  const client = await pool.connect();
+  try { await client.query("BEGIN");
+    await client.query("UPDATE coding_agent_runs SET status=$2,phase=$2,heartbeat_at=NOW(),completed_at=NOW(),lock_token=NULL,updated_at=NOW(),error=CASE WHEN $2='failed' THEN $3 ELSE error END WHERE id=$1", [task.durableRunDbId, status, failed ? finalText : null]);
+    await client.query("UPDATE agent_tasks SET status=$2,updated_at=NOW() WHERE id=$1", [task.durableTaskDbId, status]);
+    await client.query("UPDATE agent_task_items SET status=CASE WHEN $2='completed' THEN 'completed' WHEN status='in_progress' THEN 'failed' ELSE status END,evidence=CASE WHEN $2='completed' THEN $3 ELSE evidence END,updated_at=NOW() WHERE task_id=$1", [task.durableTaskDbId, status, JSON.stringify({ finalResponseStored: true, filesModified: task.filesModified ?? [] })]);
+    await client.query("SELECT pg_advisory_xact_lock($1)", [task.durableConversationDbId]);
+    const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1", [task.durableConversationDbId])).rows[0].n;
+    const final = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,run_id,role,content,sequence,metadata) VALUES($1,$2,$3,'assistant',$4,$5,$6) RETURNING id`, [randomUUID2(), task.durableConversationDbId, task.durableRunDbId, finalText, sequence, JSON.stringify({ final: true, status, filesModified: task.filesModified ?? [] })]);
+    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ finalMessageId: final.rows[0].id, actionCount: task.timeline?.length ?? 0, filesModified: task.filesModified ?? [] })]);
+    await client.query("UPDATE conversations SET last_message_at=NOW(),updated_at=NOW() WHERE id=$1", [task.durableConversationDbId]);
+    await client.query("COMMIT");
+  } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 }
 async function generateTaskTitle(task, summary) {
   const CATEGORIES = ["website", "bugfix", "deployment", "security", "vps", "email", "automation", "database", "api", "general"];
@@ -112386,7 +112541,7 @@ var serverUpdate = external_exports.object({
   status: external_exports.string().optional()
 });
 var CMD_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes max per command — prevents 45-min hangs
-function sshExec(host, port2, username, authType, privateKey, password, command = "echo connected", onData, cmdTimeoutMs) {
+function sshExec(host, port2, username, authType, privateKey, password, command = "echo connected", onData, cmdTimeoutMs, abortSignal) {
   const effectiveCmdTimeout = cmdTimeoutMs ?? CMD_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
     const client = new Client2();
@@ -112394,8 +112549,13 @@ function sshExec(host, port2, username, authType, privateKey, password, command 
     let stderr = "";
     let _cmdTimer = null;
     let _resolved = false;
-    const safeResolve = (val) => { if (!_resolved) { _resolved = true; if (_cmdTimer) clearTimeout(_cmdTimer); resolve(val); } };
-    const safeReject  = (err) => { if (!_resolved) { _resolved = true; if (_cmdTimer) clearTimeout(_cmdTimer); reject(err); } };
+    let activeStream = null;
+    const cleanupAbort = () => abortSignal?.removeEventListener("abort", onAbort);
+    const safeResolve = (val) => { if (!_resolved) { _resolved = true; if (_cmdTimer) clearTimeout(_cmdTimer); cleanupAbort(); resolve(val); } };
+    const safeReject  = (err) => { if (!_resolved) { _resolved = true; if (_cmdTimer) clearTimeout(_cmdTimer); cleanupAbort(); reject(err); } };
+    const onAbort = () => { try { activeStream?.destroy(); } catch {} try { client.end(); } catch {} safeResolve({ stdout, stderr: `${stderr}\n[CANCELLED] Stopped by user.`, code: 130 }); };
+    if (abortSignal?.aborted) return onAbort();
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
     client.on("ready", () => {
       const normalizedCommand = command.replace(/\\n/g, "\n");
       client.exec(normalizedCommand, (err, stream) => {
@@ -112871,6 +113031,7 @@ var CHAT_AGENT_SYSTEM = (username, historyLength = 1, githubToken, browserStatus
   const desktopBridgeLine = desktopConnected ? `
 \u{1F5A5}\uFE0F  DESKTOP BRIDGE: CONNECTED \u2014 the user's real local Chrome browser is LIVE.
 \u26A1 RULE: Use action="desktop_browser" when you need the user's real logged-in session (Gmail, cPanel UI, etc.).
+   For the user's local filesystem or terminal, use action="local_files" with operations [{type:"read|write",path,content?}] or action="local_terminal" with {command,cwd}. Inspect the Desktop Bridge platform first and never send Linux commands to Windows. Local and server paths are separate targets.
    Use action="browse" (Playwright headless) for screenshot verification of public URLs \u2014 it's faster and always available.
    If desktop_browser fails mid-task (bridge goes offline), the system auto-falls back to Playwright \u2014 you will receive results normally.
    desktop_browser steps: list_tabs | navigate url | click selector | type selector text | get_text selector? | screenshot | execute_js script
@@ -115334,7 +115495,7 @@ After FILE UPLOAD / FORM SAVE:
 10. Done message lists: tested URLs, what was verified, and what could NOT be verified
 11. Done message includes a Prompt Compliance checklist \u2014 [x] per confirmed feature, [ ] per unconfirmed`;
 };
-router8.post("/:id/chat", async (req, res) => {
+router8.post("/:id/chat", requireAuth, async (req, res) => {
   const schema = external_exports.object({
     messages: external_exports.array(external_exports.object({
       role: external_exports.enum(["user", "assistant"]),
@@ -115342,12 +115503,14 @@ router8.post("/:id/chat", async (req, res) => {
       // allow large ZIP deploy messages (up to ~200K chars)
     })).min(1).max(100),
     mode: external_exports.enum(["economy", "balanced", "high-power", "kimi", "v4pro", "grok", "grok-build", "auto"]).default("high-power"),
-    conversationId: external_exports.string().optional()
+    conversationId: external_exports.string().optional(),
+    clientMessageId: external_exports.string().max(100).optional()
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
   const [s2] = await db.select().from(serversTable).where(eq(serversTable.id, parseInt(req.params.id)));
   if (!s2) return res.status(404).json({ error: "Not found" });
+  if (s2.userId && s2.userId !== res.locals["userId"]) return res.status(404).json({ error: "Not found" });
   if (s2.userId) { const [_chatCr] = await db.select({ credits: usersTable.credits }).from(usersTable).where(eq(usersTable.id, s2.userId)); if (!_chatCr || _chatCr.credits <= 0) return res.status(402).json({ error: "\u26a0\ufe0f No credits remaining \u2014 please top up your account at agent.xdigitex.com to continue.", suspended: true }); }
   if (parsed.data.messages.length === 1) {
     const userMsg = (parsed.data.messages[0]?.content ?? "").toLowerCase();
@@ -115375,6 +115538,27 @@ router8.post("/:id/chat", async (req, res) => {
   const conversationId = (parsed.data.conversationId && typeof parsed.data.conversationId === 'string' && parsed.data.conversationId.length > 4)
     ? parsed.data.conversationId
     : ('conv_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36));
+  if (parsed.data.conversationId) {
+    const bound = await pool.query("SELECT user_id,server_id FROM conversations WHERE public_id=$1", [conversationId]);
+    if (bound.rowCount && (Number(bound.rows[0].user_id) !== Number(res.locals["userId"]) || Number(bound.rows[0].server_id) !== Number(s2.id))) return res.status(404).json({ error: "Conversation not found" });
+    const legacyBound = await pool.query("SELECT user_id,server_id FROM agent_conversations WHERE conversation_id=$1", [conversationId]);
+    if (legacyBound.rowCount && (Number(legacyBound.rows[0].user_id) !== Number(res.locals["userId"]) || Number(legacyBound.rows[0].server_id) !== Number(s2.id))) return res.status(404).json({ error: "Conversation not found" });
+    if (parsed.data.clientMessageId && bound.rowCount) {
+      const duplicate = await pool.query("SELECT m.public_id message_id,r.public_id run_id,r.metadata->>'legacyTaskId' task_id FROM conversation_messages m LEFT JOIN coding_agent_runs r ON r.id=m.run_id WHERE m.conversation_id=(SELECT id FROM conversations WHERE public_id=$1) AND m.client_message_id=$2 LIMIT 1", [conversationId, parsed.data.clientMessageId]);
+      if (duplicate.rowCount) return res.json({ conversationId, runId: duplicate.rows[0].run_id, taskId: duplicate.rows[0].task_id, duplicate: true });
+    }
+    if (bound.rowCount && parsed.data.messages.length === 1) {
+      const history = await pool.query("SELECT role,content FROM conversation_messages WHERE conversation_id=(SELECT id FROM conversations WHERE public_id=$1) AND role IN ('user','assistant') ORDER BY sequence DESC LIMIT 12", [conversationId]);
+      parsed.data.messages = [...history.rows.reverse().map((m) => ({ role: m.role, content: String(m.content).slice(0, 6000) })), parsed.data.messages[0]];
+    }
+    if (parsed.data.clientMessageId) {
+      const reserved = await pool.query("INSERT INTO agent_message_idempotency(conversation_id,user_id,server_id,client_message_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING client_message_id", [conversationId, res.locals["userId"], s2.id, parsed.data.clientMessageId]);
+      if (!reserved.rowCount) {
+        const prior = await pool.query("SELECT run_id,task_id FROM agent_message_idempotency WHERE conversation_id=$1 AND client_message_id=$2 AND user_id=$3 AND server_id=$4", [conversationId, parsed.data.clientMessageId, res.locals["userId"], s2.id]);
+        return res.json({ conversationId, runId: prior.rows[0]?.run_id, taskId: prior.rows[0]?.task_id, duplicate: true });
+      }
+    }
+  }
   // ── CHAT CONTROLLER INTERCEPT ────────────────────────────────────────────
   // If there is already a running task for this conversation, route the new
   // message into it instead of spawning a second full agent loop.
@@ -115458,6 +115642,7 @@ router8.post("/:id/chat", async (req, res) => {
   };
   task.runId = runId;
   task.conversationId = conversationId;
+  if (parsed.data.clientMessageId) pool.query("UPDATE agent_message_idempotency SET run_id=$1,task_id=$2 WHERE conversation_id=$3 AND client_message_id=$4", [runId, taskId, conversationId, parsed.data.clientMessageId]).catch(()=>{});
   chatTaskStore.set(taskId, task);
   // Persist conversation + run to DB
   pool.query(
@@ -115466,10 +115651,13 @@ router8.post("/:id/chat", async (req, res) => {
     [conversationId, s2.id, s2.userId ?? null, runId]
   ).catch(() => {});
   pool.query(
-    `INSERT INTO agent_runs(run_id,conversation_id,server_id,user_id,status,phase,input,task_id) VALUES($1,$2,$3,$4,'running','planning',$5,$6)
+    `INSERT INTO agent_runs(run_id,conversation_id,server_id,user_id,status,phase,input,task_id,started_at,heartbeat_at,current_step) VALUES($1,$2,$3,$4,'running','planning',$5,$6,NOW(),NOW(),'Planning task')
      ON CONFLICT(run_id) DO NOTHING`,
     [runId, conversationId, s2.id, s2.userId ?? null, task.input, taskId]
   ).catch(() => {});
+  await bridgeServerAgentRunStart(task, s2, task.input).catch((error) => req.log?.error({ error }, "Failed to create durable server-agent run"));
+  if (parsed.data.clientMessageId && task.durableRunDbId) pool.query("UPDATE conversation_messages SET client_message_id=$1 WHERE run_id=$2 AND role='user'", [parsed.data.clientMessageId, task.durableRunDbId]).catch(()=>{});
+  pool.query("UPDATE conversations SET title=CASE WHEN title IN ('New chat','New conversation') THEN $2 ELSE title END,last_message_at=NOW(),updated_at=NOW() WHERE public_id=$1 AND user_id=$3 AND server_id=$4", [conversationId, conciseConversationTitle(task.input), s2.userId, s2.id]).catch(()=>{});
   const send2 = (type, payload) => { if (type === "think" && payload && payload.text) { const _t = payload.text; if (_t.includes("Watchdog") || _t.includes("Format error") || _t.includes("Repeated failures") || _t.includes("recovery agent") || _t.includes("subagent for JSON") || _t.includes("JSON retry") || _t.includes("Context trimmed") || _t.includes("Builder timeout") || _t.includes("UI build agent timeout") || _t.includes("Large file (") || _t.includes("Reconnecting to agent")) return; } return chatTaskEmit(task, type, payload); };
   res.json({ taskId, runId, conversationId });
   // Emit run lifecycle start event
@@ -115896,9 +116084,15 @@ void (async () => {
       const isAuto = parsed.data.mode === "auto";
       const browserStatus = await browserProbeResult;
       const userTaskText = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
+      const explicitTargetMatch = userTaskText.match(/(?:^|\s)([a-z0-9.-]+\/[^\s,;]+\.(?:php|html?|css|js|ts|tsx|jsx|py|rb|go|java))(?:\s|,|;|$)/i);
+      const requestedUrlMatch = userTaskText.match(/https?:\/\/((?:[a-z0-9-]+\.)+[a-z]{2,})(\/[^\s,;]*)?/i);
+      const requestedDomainPathMatch = userTaskText.match(/\b((?:[a-z0-9-]+\.)+[a-z]{2,})(\/[^\s,;]*)?/i);
+      const requestedDomain = (requestedUrlMatch?.[1] ?? requestedDomainPathMatch?.[1] ?? "").toLowerCase();
+      const requestedWebPath = requestedUrlMatch?.[2] ?? requestedDomainPathMatch?.[2] ?? "/";
+      const simpleTaskFastPath = !!explicitTargetMatch && /\b(add|change|edit|replace|remove|rename|fix|check)\b/i.test(userTaskText) && !/\b(database|migration|schema|multiple|entire|full system|architecture|rebuild)\b/i.test(userTaskText);
       const [pastExperiences, knowledgeResult] = await Promise.all([
-        searchExperiences(userTaskText, 4).catch(() => []),
-        buildKnowledgeBlock(userTaskText).catch(() => ({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }))
+        simpleTaskFastPath ? Promise.resolve([]) : searchExperiences(userTaskText, 3, s2.id).catch(() => []),
+        simpleTaskFastPath ? Promise.resolve({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }) : buildKnowledgeBlock(userTaskText).catch(() => ({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }))
       ]);
       const memoryBlock = formatMemoryBlock(pastExperiences);
       const knowledgeBlock = knowledgeResult.block;
@@ -115934,7 +116128,9 @@ void (async () => {
       // ── Verification Engine ───────────────────────────────────────────────
       var xd_verPlan = {profiles:[],steps:[],missionBlock:"",needsAuth:false,canSelfRegister:false};
       try {
-        xd_verPlan = xd_runVerificationEngine(userTaskText, 3);
+        // Exact-file/simple requests must not inherit broad site, checkout, auth,
+        // or payment verification profiles. The fast path verifies only the task.
+        xd_verPlan = simpleTaskFastPath ? {profiles:[],steps:[],missionBlock:"",needsAuth:false,canSelfRegister:false} : xd_runVerificationEngine(userTaskText, 3);
         if (xd_verPlan.profiles.length > 0) {
           send2("verification_plan", {
             profiles: xd_verPlan.profiles.map(function(m) { return { name: m.profile.meta.name, file: m.profile.file, confidence: m.confidence, keywords: m.matchedKeywords }; }),
@@ -115946,12 +116142,16 @@ void (async () => {
       } catch {}
       // ─────────────────────────────────────────────────────────────────────
       }
-      var xd_finalSysPrompt = xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt;
+      const xd_readOnlyTask = /\b(check|inspect|status|report|show|list|verify|diagnose)\b/i.test(userTaskText) && (/\b(?:do not|don't|without)\s+(?:make\s+)?(?:any\s+)?(?:changes?|modify|restart|reload|write|install|configure|deploy|delete|remove|update)\b/i.test(userTaskText) || !/\b(fix|change|modify|write|create|install|restart|reload|deploy|delete|remove|update|configure)\b/i.test(userTaskText));
+      const xd_compactServerPrompt = `You are XDIGITEX Server Agent connected only to ${s2.username}@${s2.host}:${s2.port}. Complete the user's read-only request autonomously. Use the minimum targeted commands and never modify files, configuration, services, SSH settings, authentication, or firewall rules. Every command must have a timeout. Do not repeat an unchanged command. Respond with exactly one JSON object per turn: {"thought":"short user-facing progress","action":"run","commands":[{"cmd":"timeout 30 <read-only command>","desc":"purpose"}]} or, only after the requested behavior is verified, {"thought":"verified","action":"done","message":"Completed.\\n\\nFindings:\\n...\\n\\nVerification:\\n..."}. A command completing is not the task completing; continue until all parts of the request are checked. Keep output concise and never expose internal notes.`;
+      var xd_finalSysPrompt = xd_readOnlyTask ? xd_compactServerPrompt : (xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt);
       // ─────────────────────────────────────────────────────────────────────
       const aiMessages = [
         { role: "system", content: xd_finalSysPrompt },
         ...parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content }))
       ];
+      if (requestedDomain) aiMessages.push({ role: "user", content: `[DOMAIN TARGET BINDING]\nSSH execution target: ${s2.username}@${s2.host}:${s2.port}. Website target: https://${requestedDomain}${requestedWebPath}. These are different identities: the server IP can serve a default virtual host and an HTTP 403 from the raw IP does not mean the requested domain failed. The expected project root is /home/${s2.username}/${requestedDomain}; stay inside that root unless direct evidence proves a different document root. Search requested literals with grep -nF, not regex grep. Verify the hostname URL first; if DNS routing is unavailable, use curl --resolve ${requestedDomain}:443:${s2.host} https://${requestedDomain}${requestedWebPath}. A login redirect can be valid behavior. For a small source change, exact source/literal evidence plus the relevant syntax check is sufficient; a browser screenshot is optional and its absence must not force PARTIAL. Once the requested state and relevant verification pass, emit done immediately without extra discovery commands.` });
+      if (simpleTaskFastPath) aiMessages.push({ role: "user", content: `[SIMPLE TASK FAST PATH]\nOriginal request (authoritative): ${userTaskText.slice(0, 1200)}\nExact target: ${explicitTargetMatch[1]}\nInspect this exact source file first. If the requested state already exists, do not edit it: run one relevant syntax check, verify the requested meaning, then finish. Otherwise make only the requested change, run one relevant syntax check, optionally perform at most one live visual check, then finish. Do not scan the project, read generated caches/vendor/node_modules, invent optional requirements, or restart planning.` });
       {
         const bridgeNowConnected = isConnected(s2.userId);
         const lastUserMsg = [...parsed.data.messages].reverse().find((m2) => m2.role === "user")?.content ?? "";
@@ -115997,6 +116197,7 @@ Tell the user to check that the agent script is still running in their terminal 
       let totalPromptTokens = 0;
       let totalCompletionTokens = 0;
       let totalIterations = 0;
+      let totalCommands = 0;
       let doneAttempts = 0;
       let hasBrowsed = false;
       let consecutiveVerifyOnlyIters = 0;
@@ -116026,7 +116227,7 @@ Tell the user to check that the agent script is still running in their terminal 
           durationMs
         });
         const userTask = parsed.data.messages[parsed.data.messages.length - 1]?.content?.slice(0, 1e3) ?? "";
-        const taskStatus = task.status === "failed" ? "failed" : task.status === "cancelled" ? "cancelled" : "completed";
+        const taskStatus = ["failed", "cancelled", "blocked", "partially_completed"].includes(task.status) ? task.status : "completed";
         const [inserted] = await db.insert(serverTaskHistoryTable).values({
           serverId: s2.id,
           task: userTask,
@@ -116037,6 +116238,11 @@ Tell the user to check that the agent script is still running in their terminal 
           totalTokens: total,
           iterations: totalIterations,
           durationMs,
+          creditsUsed: task.creditsUsed ?? 0,
+          runId: task.runId,
+          conversationId: task.conversationId,
+          finalResponse: summary?.slice(0, 8e3) ?? "",
+          steps: JSON.stringify(planState ?? {}),
           status: taskStatus,
           lastAction: task.lastAction?.slice(0, 300) ?? "",
           timeline: JSON.stringify(task.timeline.slice(-50)),
@@ -116097,7 +116303,14 @@ Tell the user to check that the agent script is still running in their terminal 
         }
       };
       const cmdRunCount = /* @__PURE__ */ new Map();
+      const commandResultCount = /* @__PURE__ */ new Map();
+      const commandResultCache = /* @__PURE__ */ new Map();
+      let mutationEpoch = 0;
+      let budgetFinalizationRequested = false;
       const originalUserMessage = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
+      const taskComplexity = simpleTaskFastPath ? "simple" : /\b(rebuild|migrate|architecture|entire|full|multiple|complete system)\b/i.test(originalUserMessage) ? "complex" : /\b(deploy|install|implement|redesign|integrate)\b/i.test(originalUserMessage) ? "moderate" : "simple";
+      const maxIterations = taskComplexity === "complex" ? 40 : taskComplexity === "moderate" ? 24 : 10;
+      const maxCommands = taskComplexity === "complex" ? 80 : taskComplexity === "moderate" ? 40 : 12;
       const homeDir = s2.username === "root" ? "/root" : `/home/${s2.username}`;
       let currentRole = "task_manager";
       let consecutiveFailBatches = 0;
@@ -116181,7 +116394,21 @@ Tell the user to check that the agent script is still running in their terminal 
         }
       };
       let hasAddedMaxStepsWarning = false;
-      for (let iter = 0; iter < 80; iter++) {
+      for (let iter = 0; iter < maxIterations; iter++) {
+        if (totalCommands >= maxCommands) {
+          if (!budgetFinalizationRequested) {
+            budgetFinalizationRequested = true;
+            aiMessages.push({ role: "user", content: `[RUN-WIDE COMMAND BUDGET REACHED]\nDo not run more tools or restart planning. Evaluate the authoritative original request against facts already collected. If satisfied, respond action="done" with a concise completed/verified report. Otherwise respond action="done" with STATUS: PARTIALLY VERIFIED and only the genuinely unresolved requirement.` });
+          } else {
+            task.status = "partially_completed";
+            send2("reply", { text: "Partially completed. The run-wide command budget was reached and required work remains. Completed work was preserved." });
+            break;
+          }
+        }
+        if (aiMessages.length > 14) {
+          const recent = aiMessages.slice(-10).map((message) => ({ ...message, content: String(message.content ?? "").slice(0, 6000) }));
+          aiMessages.splice(1, aiMessages.length - 1, { role: "user", content: `[COMPACT RUN CONTEXT]\nOriginal request: ${originalUserMessage.slice(0, 1200)}\nCompleted commands: ${totalCommands}. Current role: ${currentRole}. Continue from the latest results below; do not repeat prior inspection.` }, ...recent);
+        }
         // ── Check for new user messages injected via chat intercept ──
         if (task.newUserMessages && task.newUserMessages.length > 0) {
           const _newMsg = task.newUserMessages.shift();
@@ -116198,11 +116425,13 @@ Tell the user to check that the agent script is still running in their terminal 
         }
         let iterModel = baseModel;
         let iterClient = getAIClient(baseProvider);
+        let iterProvider = baseProvider;
         if (_openaiReliefRemaining > 0 && process.env["OPENAI_API_KEY"]) {
           _openaiReliefRemaining--;
           const _relief = cheapOpenAIModel();
           iterModel = _relief.model;
           iterClient = getAIClient("openai");
+          iterProvider = "openai";
         }
         if (isAuto) {
           const prevRole = currentRole;
@@ -116238,7 +116467,8 @@ Tell the user to check that the agent script is still running in their terminal 
             }
           }
           iterModel = autoModel(currentRole);
-          iterClient = getAIClient(autoProvider(currentRole));
+          iterProvider = autoProvider(currentRole);
+          iterClient = getAIClient(iterProvider);
           if (currentRole !== prevRole || iter === 0) {
             const roleLabel = {
               task_manager: "PLANNING",
@@ -116580,9 +116810,9 @@ After fixing, verify the file works, then action="done".`
           }
           throw lastErr;
         };
-        if (!hasAddedMaxStepsWarning && iter >= 74) {
+        if (!hasAddedMaxStepsWarning && iter >= maxIterations - 4) {
           hasAddedMaxStepsWarning = true;
-          const remaining = 80 - iter;
+          const remaining = maxIterations - iter;
           aiMessages.push({
             role: "user",
             content: [
@@ -116600,9 +116830,18 @@ After fixing, verify the file works, then action="done".`
               `This constraint overrides all other instructions. Finalize and done.`
             ].join("\n")
           });
-          send2("think", { text: `\u26A0\uFE0F Step limit approaching (iter ${iter}/80) \u2014 wrap-up signal injected` });
+          send2("think", { text: `\u26A0\uFE0F Step limit approaching (iter ${iter}/${maxIterations}) \u2014 wrap-up signal injected` });
+        }
+        const creditLedger = await reserveServerAgentCredits(task, iterProvider, iterModel, iter + 1);
+        if (!creditLedger) {
+          task.status = "blocked";
+          const blockedText = "Blocked.\n\nReason:\nInsufficient credits.\n\nPlease add credits to continue using the AI Coding Agent.";
+          send2("reply", { text: blockedText });
+          send2("run_blocked", { runId: task.runId, conversationId: task.conversationId, status: "blocked", reason: "Insufficient credits" });
+          break;
         }
         const completion = await callWithRetry();
+        await settleServerAgentCredits(task, creditLedger, completion.usage, iterProvider, iterModel);
         if (completion.usage) {
           totalPromptTokens += completion.usage.prompt_tokens ?? 0;
           totalCompletionTokens += completion.usage.completion_tokens ?? 0;
@@ -116751,6 +116990,8 @@ Retry your task using the cPanel actions above.`
         }
         if (action.action === "run" && Array.isArray(action.commands) && action.commands.length) {
           const cmds = action.commands.filter((c) => c && typeof c.cmd === "string").slice(0, 10);
+          if (totalCommands + cmds.length > maxCommands) cmds.splice(Math.max(0, maxCommands - totalCommands));
+          totalCommands += cmds.length;
           const normCmd = (c) => c.replace(/\s+/g, " ").trim();
           const repeatCmds = cmds.filter((c) => (cmdRunCount.get(normCmd(c.cmd)) ?? 0) >= 1);
           const allRepeats = repeatCmds.length === cmds.length;
@@ -116795,7 +117036,22 @@ DO NOT repeat these commands again.`;
             };
           });
           for (let ci = 0; ci < cmds.length; ci++) {
+            if (task.creditExhausted) {
+              task.status = "blocked";
+              send2("reply", { text: "Blocked.\n\nReason:\nInsufficient credits.\n\nCompleted work has been preserved. Please add credits to continue using the AI Coding Agent." });
+              send2("run_blocked", { runId: task.runId, conversationId: task.conversationId, status: "blocked", reason: "Insufficient credits" });
+              break;
+            }
             let { cmd, desc: desc3 } = cmds[ci];
+            const normalizedForCache = normCmd(cmd);
+            const isMutatingCommand = /(?:^|[;&|]\s*)(?:sed\s+-i|perl\s+-i|cp\s|mv\s|rm\s|tee\s|printf\s|echo\s.*>|php\s+.*(?:write|put)|python\w*\s+.*(?:write|open))|(?:^|\s)>(?!>)/i.test(cmd);
+            const cacheKey = `${mutationEpoch}:${s2.id}:${normalizedForCache}`;
+            if (!isMutatingCommand && commandResultCache.has(cacheKey)) {
+              const cached = commandResultCache.get(cacheKey);
+              send2("cmd_done", { index: ci, code: cached.code, cached: true, classification: cached.classification });
+              cmdResults.push(`$ ${cmd}\n[CACHED ${cached.classification}]\n${cached.summary}\n[exit ${cached.code}]`);
+              continue;
+            }
             const destructive = DESTRUCTIVE_PATTERNS.find(({ re }) => re.test(cmd));
             if (destructive) {
               const approval = await requestApproval(cmd, destructive.reason);
@@ -116821,18 +117077,23 @@ DO NOT repeat these commands again.`;
               s2.privateKey,
               s2.password,
               cmd,
-              (chunk) => send2("cmd_output", { index: ci, chunk })
+              (chunk) => send2("cmd_output", { index: ci, chunk }),
+              void 0,
+              task.abort.signal
             ).catch((e2) => ({
               stdout: "",
               stderr: String(e2 instanceof Error ? e2.message : e2),
               code: -1
             }));
-            send2("cmd_done", { index: ci, code: result.code });
+            const commandName = /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)grep(?:\s|$)/i.test(cmd) ? "grep" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)diff(?:\s|$)/i.test(cmd) ? "diff" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)(?:test|\[)(?:\s|$)/i.test(cmd) ? "test" : cmd.trim().match(/^(?:timeout\s+\d+\s+)?(?:env\s+\S+\s+)*([\w.-]+)/)?.[1]?.toLowerCase() ?? "";
+            const toolClassification = commandName === "grep" && result.code === 1 ? "NO_MATCH" : commandName === "grep" && result.code === 2 ? "TOOL_SYNTAX_ERROR" : commandName === "diff" && result.code === 1 ? "DIFFERENCES_FOUND" : commandName === "test" && result.code === 1 ? "CONDITION_FALSE" : result.code === 0 ? "SUCCESS" : "COMMAND_FAILURE";
+            send2("cmd_done", { index: ci, code: result.code, classification: toolClassification });
+            if (toolClassification === "COMMAND_FAILURE") task.hadCommandFailure = true;
             const rawOut = [
               result.stdout.trim(),
               result.stderr.trim() ? `[stderr] ${result.stderr.trim()}` : ""
             ].filter(Boolean).join("\n") || "(no output)";
-            const trimLines = (s3, max = 60) => {
+            const trimLines = (s3, max = 20) => {
               const lines = s3.split("\n");
               if (lines.length <= max) return s3;
               const kept = lines.slice(-max);
@@ -116842,18 +117103,31 @@ ${kept.join("\n")}`;
             const out = trimLines(rawOut);
             cmdResults.push(`$ ${cmd}
 ${out}
-[exit ${result.code}]`);
+[${toolClassification}; exit ${result.code}]`);
+            if (isMutatingCommand && result.code === 0) mutationEpoch++;
+            else if (!isMutatingCommand) commandResultCache.set(cacheKey, { code: result.code, classification: toolClassification, summary: out.slice(0, 4000), timestamp: Date.now() });
           }
-          // Mid-task credit check
+          if (task.status === "blocked") break;
+          // Mid-task credit check before another model/tool cycle.
           const [_midCr] = await db.select({ credits: usersTable.credits }).from(usersTable).where(eq(usersTable.id, s2.userId));
           if (!_midCr || _midCr.credits <= 0) {
-            send2("reply", { text: "⏸️ Task suspended — credits exhausted. Please top up to continue." });
-            return res.end();
+            task.status = "blocked";
+            send2("reply", { text: "Blocked.\n\nReason:\nInsufficient credits.\n\nCompleted work has been preserved. Please add credits to continue using the AI Coding Agent." });
+            break;
           }
           const resultText = cmdResults.join("\n\n\u2500\u2500\u2500\u2500\u2500\n\n");
+          const resultHash = createHash("sha256").update(resultText).digest("hex").slice(0, 16);
+          const resultKey = `${cmds.map((c) => normCmd(c.cmd)).join("|")}::${resultHash}`;
+          const unchangedCount = (commandResultCount.get(resultKey) ?? 0) + 1;
+          commandResultCount.set(resultKey, unchangedCount);
+          if (unchangedCount >= 2) {
+            task.status = "partially_completed";
+            send2("reply", { text: "Partially completed.\n\nNo-progress loop detected: equivalent commands returned unchanged results twice. Completed work was preserved." });
+            break;
+          }
           aiMessages.push({ role: "assistant", content: raw });
-          const allFailed = cmds.length > 0 && cmdResults.every((r2) => /\[exit [^0]/.test(r2));
-          const anySucceeded = cmdResults.some((r2) => /\[exit 0\]/.test(r2));
+          const allFailed = cmds.length > 0 && cmdResults.every((r2) => /\[COMMAND_FAILURE; exit [^0]/.test(r2));
+          const anySucceeded = cmdResults.some((r2) => /\[(?:SUCCESS|NO_MATCH|DIFFERENCES_FOUND|CONDITION_FALSE); exit/.test(r2));
           if (anySucceeded) {
             consecutiveFailBatches = 0;
           } else if (allFailed) {
@@ -116866,10 +117140,10 @@ ${out}
             /^Killed\s*$/im,
             /exit code 124/,
             // timeout
-            /\[exit 124\]/
+            /\[COMMAND_FAILURE; exit 124\]/
           ];
           const blockerResult = cmdResults.find(
-            (r2) => /\[exit [^0]/.test(r2) && BLOCKER_PATTERNS.some((p) => p.test(r2))
+            (r2) => /\[COMMAND_FAILURE; exit [^0]/.test(r2) && BLOCKER_PATTERNS.some((p) => p.test(r2))
           );
           if (blockerResult && isAuto) {
             const blockerLine = blockerResult.split("\n").find((l) => BLOCKER_PATTERNS.some((p) => p.test(l))) ?? blockerResult.split("\n")[1] ?? "";
@@ -117017,7 +117291,7 @@ ${resultText}
 Now CONTINUE the task. Do NOT ask the user \u2014 search, read, and fix autonomously.`
             });
           }
-          if (!http200Confirmed && cmdResults.some((r2) => /HTTP 200/i.test(r2) && /\[exit 0\]/.test(r2))) {
+          if (!http200Confirmed && cmdResults.some((r2) => /HTTP 200/i.test(r2) && /\[SUCCESS; exit 0\]/.test(r2))) {
             http200Confirmed = true;
           }
           send2("cmd_results", { text: resultText });
@@ -117065,7 +117339,8 @@ Now CONTINUE the task. Do NOT ask the user \u2014 search, read, and fix autonomo
           }
 
           browseAttempts++;
-          if (browseAttempts > 3) {
+          const maxBrowseAttempts = taskComplexity === "simple" ? 1 : 3;
+          if (browseAttempts > maxBrowseAttempts) {
             send2("think", { text: "Screenshot SKIPPED \u2014 already browsed 3+ times this session." });
             aiMessages.push({ role: "assistant", content: raw });
             aiMessages.push({
@@ -117308,6 +117583,29 @@ ALL BROWSER STEPS PASSED (${steps.length}/${steps.length}).`,
           ].join("\n");
           aiMessages.push({ role: "assistant", content: raw });
           aiMessages.push({ role: "user", content: fullBrowserContext });
+        } else if (action.action === "local_terminal" && action.command) {
+          if (!isConnected(s2.userId)) {
+            task.status = "blocked";
+            send2("reply", { text: "Blocked.\n\nReason:\nDesktop Bridge disconnected.\n\nReconnect the local computer to continue safely." });
+            break;
+          }
+          send2("think", { text: "Running command on connected local computer…" });
+          const localResult = await sendCommand(s2.userId, "terminal.run", { command: action.command, cwd: action.cwd }, 12e4);
+          aiMessages.push({ role: "assistant", content: raw });
+          aiMessages.push({ role: "user", content: `LOCAL TERMINAL RESULT (targetType=local,targetId=desktop_${s2.userId}):\n${JSON.stringify(redactSecrets(localResult)).slice(0, 12000)}` });
+        } else if (action.action === "local_files" && Array.isArray(action.operations) && action.operations.length) {
+          if (!isConnected(s2.userId)) {
+            task.status = "blocked";
+            send2("reply", { text: "Blocked.\n\nReason:\nDesktop Bridge disconnected.\n\nReconnect the local computer to continue safely." });
+            break;
+          }
+          const localResults = [];
+          for (const operation of action.operations.slice(0, 20)) {
+            if (operation.type === "read") localResults.push(await sendCommand(s2.userId, "file.read", { path: operation.path }, 3e4));
+            else if (operation.type === "write") localResults.push(await sendCommand(s2.userId, "file.write", { path: operation.path, content: operation.content ?? "" }, 3e4));
+          }
+          aiMessages.push({ role: "assistant", content: raw });
+          aiMessages.push({ role: "user", content: `LOCAL FILE RESULTS (targetType=local,targetId=desktop_${s2.userId}):\n${JSON.stringify(redactSecrets(localResults)).slice(0, 12000)}` });
         } else if (action.action === "desktop_browser" && Array.isArray(action.steps) && action.steps.length) {
           if (!isConnected(s2.userId)) {
             send2("think", { text: "\u26A0\uFE0F Desktop Bridge offline \u2014 falling back to Playwright Chromium for screenshots\u2026" });
@@ -117802,6 +118100,12 @@ For each failure:
             aiMessages.push({ role: "user", content: fullReport });
           }
         } else if (action.action === "reply") {
+          const replyText = String(action.message ?? "");
+          if (/\bPATH\s+[ABC]\b|queue is not relevant|state\.json|internal orchestration/i.test(replyText)) {
+            send2("step", { text: "Preparing the final response." });
+            aiMessages.push({ role: "assistant", content: raw }, { role: "user", content: "That response contains internal orchestration details. Do not expose PATH labels, queue mechanics, or state.json. Continue the actual work if required, otherwise return action=done with a concise human-readable result and verification." });
+            continue;
+          }
 
           // \u2500 Save verified experience to memory \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
           try {
@@ -117873,6 +118177,10 @@ For each failure:
           const userTask = (parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "").toLowerCase();
           const doneMsg = action.message ?? "";
           const doneMsgLower = doneMsg.toLowerCase();
+          if (task.hadCommandFailure && !/status:\s*verified/i.test(doneMsgLower)) {
+            task.status = "partially_completed";
+            action.message = `Partially completed.\n\n${doneMsg || "Some requested checks could not be completed."}\n\nVerification that could not be completed:\nOne or more server commands failed. Review the expandable execution log for details.`;
+          }
           const isSingleFileCheckpoint = isAuto && (currentRole === "builder" || currentRole === "ui_builder") && /^BUILT:\s*\S+/i.test(doneMsg.trim());
           if (isSingleFileCheckpoint) {
             const builtFile = doneMsg.trim().replace(/^BUILT:\s*/i, "").split(/[\s,]/)[0] ?? "file";
@@ -117902,7 +118210,7 @@ Now build the next file:
             roleStartedAt = Date.now();
             continue;
           }
-          const isComplexTask = /build|rebuild|fix|deploy|install|setup|creat|redesign|payment|api|site|connect|implement|develop|add|update/i.test(userTask);
+          const isComplexTask = taskComplexity !== "simple";
           const isBrowseTask = /^browse\s+https?:\/\//i.test(userTask.trim()) || /\bbrowse\b.*https?:\/\//i.test(userTask);
           const isFileBuildTask = isAuto && /ALL FILES COMPLETE/i.test(doneMsg);
           const hasBrowseEvidence = hasBrowsed || /screenshot|vision|browser|browsed/i.test(doneMsgLower);
@@ -118030,7 +118338,7 @@ After curl confirms HTTP 200 and real HTML content \u2192 action="done" STATUS: 
               continue;
             }
           }
-          if (isComplexTask && !hasVerification && doneAttempts < 3) {
+          if (!requestedDomain && isComplexTask && !hasVerification && doneAttempts < 3) {
             doneAttempts++;
             if (typeof xd_verPlan !== "undefined" && xd_verPlan && xd_verPlan.missionBlock && doneAttempts === 1) {
               var _vpNames = xd_verPlan.profiles.map(function(m){return m.profile.meta.name;}).join(", ");
@@ -118074,6 +118382,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
 
           // ── XD Save as Automation ────────────────────────────────
           try {
+            if (!/\b(?:save|create|capture)\b.{0,30}\bautomation\b|\bautomate\b/i.test(userTask)) throw new Error("Automation was not requested");
             const xd_st = (userTask + " " + doneMsg).toLowerCase();
             const xd_ac = (() => {
               if (/paystack|stripe|payment|checkout|gateway|mpesa|flutterwave/.test(xd_st)) return "api";
@@ -118108,11 +118417,12 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
           break;
         }
       }
-      await flushTokens("Max iterations reached").catch(() => {
+      await flushTokens(`Run finished after ${totalIterations} model cycles and ${totalCommands} commands`).catch(() => {
       });
     } catch (err) {
-      task.status = "failed";
+      if (task.status !== "blocked" && task.status !== "cancelled") task.status = "failed";
       const rawMsg = String(err instanceof Error ? err.message : err);
+      console.error("[server-agent-runtime]", { errorName: err instanceof Error ? err.name : typeof err, message: rawMsg, stack: err instanceof Error ? err.stack : undefined, runId: task.runId, conversationId: task.conversationId });
       const userMsg = (() => {
         const m2 = rawMsg.toLowerCase();
         if (m2.includes("failed to fetch") || m2.includes("fetch failed") || m2.includes("econnrefused") || m2.includes("enotfound") || m2.includes("network") || m2.includes("connection error") || m2.includes("socket")) return "\u26A0\uFE0F Unable to reach AI service \u2014 please try again in a moment.";
@@ -118120,22 +118430,24 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
         if (m2.includes("429") || m2.includes("rate limit") || m2.includes("quota")) return "\u26A0\uFE0F AI service is busy \u2014 please wait a moment and try again.";
         if (m2.includes("timed out") || m2.includes("timeout") || m2.includes("aborted")) return "\u26A0\uFE0F AI service timed out \u2014 the server may be under heavy load. Please try again.";
         if (m2.includes("context") && m2.includes("length")) return "\u26A0\uFE0F Request too long \u2014 please start a new conversation or shorten your message.";
-        return rawMsg;
+        return "Internal agent runtime error.";
       })();
       send2("error", { text: userMsg });
+      if (!task.lastReply) send2("reply", { text: `Failed.\n\nReason:\n${userMsg}\n\nCompleted work, if any, has been preserved.` });
       notifyTaskComplete(task, "", true).catch(() => {
       });
     } finally {
       if (task.status === "running") task.status = "completed";
+      if (!task.lastReply) chatTaskEmit(task, "reply", { text: task.status === "completed" ? "Completed. The requested work finished; see Task History for the recorded actions and verification." : task.status === "cancelled" ? "Cancelled. Completed work was preserved." : task.status === "blocked" ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : "Failed. The task stopped after bounded recovery attempts." });
       // Emit lifecycle event + persist to DB
       try {
-        const _runFailed = task.status === "failed" || task.status === "error" || task.status === "cancelled";
-        const _runEvt = _runFailed ? "run_failed" : "run_completed";
+        const _runFailed = task.status === "failed" || task.status === "error" || task.status === "cancelled" || task.status === "blocked" || task.status === "partially_completed";
+        const _runEvt = task.status === "blocked" ? "run_blocked" : _runFailed ? "run_failed" : "run_completed";
         chatTaskEmit(task, _runEvt, { runId: task.runId, conversationId: task.conversationId, status: task.status });
         if (task.runId) {
           pool.query(
-            `UPDATE agent_runs SET status=$1, phase=$2, completed_at=NOW() WHERE run_id=$3`,
-            [task.status, _runFailed ? "failed" : "completed", task.runId]
+            `UPDATE agent_runs SET status=$1,phase=$2,completed_at=NOW(),finished_at=NOW(),heartbeat_at=NOW(),current_step=$2 WHERE run_id=$3`,
+            [task.status, task.status, task.runId]
           ).catch(() => {});
           pool.query(
             `UPDATE agent_conversations SET updated_at=NOW() WHERE conversation_id=$1`,
@@ -118143,6 +118455,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
           ).catch(() => {});
         }
       } catch (_le) {}
+      await bridgeServerAgentRunFinish(task).catch(() => {});
       chatTaskEmit(task, "stream_end", {});
       sshExec(
         s2.host,
@@ -118159,8 +118472,10 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
     }
   })();
 });
-router8.get("/:id/tasks", (req, res) => {
+router8.get("/:id/tasks", requireAuth, async (req, res) => {
   const serverId = parseInt(req.params["id"] ?? "0");
+  const owned = await pool.query("SELECT id FROM servers WHERE id=$1 AND user_id=$2", [serverId, res.locals["userId"]]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Not found" });
   const tasks = [...chatTaskStore.values()].filter((t2) => t2.serverId === serverId).map((t2) => ({
     id: t2.id,
     status: t2.status,
@@ -118169,12 +118484,18 @@ router8.get("/:id/tasks", (req, res) => {
   })).sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
   return res.json(tasks);
 });
+router8.get("/:id/agent-context", requireAuth, async (req, res) => {
+  const serverId = parseInt(req.params["id"] ?? "0"), userId = res.locals["userId"];
+  const owned = await pool.query("SELECT id,name,host,port,username FROM servers WHERE id=$1 AND user_id=$2", [serverId, userId]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Not found" });
+  const result = await pool.query(`SELECT run_id,conversation_id,task_id,status,phase,input,started_at,finished_at,completed_at,heartbeat_at,current_step,cancel_requested_at,CASE WHEN COALESCE(finished_at,completed_at) IS NOT NULL THEN EXTRACT(EPOCH FROM (COALESCE(finished_at,completed_at)-started_at))*1000 ELSE EXTRACT(EPOCH FROM (NOW()-started_at))*1000 END AS elapsed_ms FROM agent_runs WHERE server_id=$1 AND user_id=$2 ORDER BY started_at DESC NULLS LAST,id DESC LIMIT 1`, [serverId, userId]);
+  return res.json({ server: owned.rows[0], run: result.rows[0] ?? null });
+});
 router8.get("/:id/runs/:runId", requireAuth, async (req, res) => {
   try {
     const _r = await pool.query(
-      `SELECT run_id, conversation_id, status, phase, completed_at
-       FROM agent_runs WHERE run_id=$1 AND server_id=$2 LIMIT 1`,
-      [req.params["runId"], parseInt(req.params["id"] ?? "0")]
+      `SELECT run_id,conversation_id,status,phase,started_at,finished_at,completed_at,heartbeat_at,current_step,CASE WHEN COALESCE(finished_at,completed_at) IS NOT NULL THEN EXTRACT(EPOCH FROM (COALESCE(finished_at,completed_at)-started_at))*1000 ELSE EXTRACT(EPOCH FROM (NOW()-started_at))*1000 END AS elapsed_ms FROM agent_runs WHERE run_id=$1 AND server_id=$2 AND user_id=$3 LIMIT 1`,
+      [req.params["runId"], parseInt(req.params["id"] ?? "0"), res.locals["userId"]]
     );
     if (!_r.rows.length) return res.status(404).json({ error: "Run not found" });
     return res.json(_r.rows[0]);
@@ -118182,14 +118503,17 @@ router8.get("/:id/runs/:runId", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "DB error" });
   }
 });
-router8.get("/:id/tasks/:taskId/events", async (req, res) => {
+router8.get("/:id/tasks/:taskId/events", requireAuth, async (req, res) => {
   const task = chatTaskStore.get(req.params["taskId"] ?? "");
+  const serverId = parseInt(req.params["id"] ?? "0");
+  const owned = await pool.query("SELECT id FROM servers WHERE id=$1 AND user_id=$2", [serverId, res.locals["userId"]]);
+  if (!owned.rowCount || (task && task.serverId !== serverId)) return res.status(404).json({ error: "Not found" });
   if (!task) {
     // Check DB: if run was completed, send stream_end so UI unlocks instead of staying stuck
     try {
       const _dbRun = await pool.query(
-        `SELECT status FROM agent_runs WHERE task_id=$1 LIMIT 1`,
-        [req.params["taskId"]]
+        `SELECT status FROM agent_runs WHERE task_id=$1 AND server_id=$2 AND user_id=$3 LIMIT 1`,
+        [req.params["taskId"], serverId, res.locals["userId"]]
       );
       if (_dbRun.rows.length && _dbRun.rows[0].status !== "running") {
         const _st = _dbRun.rows[0].status;
@@ -118251,9 +118575,9 @@ router8.get("/:id/tasks/:taskId/events", async (req, res) => {
     task.subscribers.delete(sub);
   });
 });
-router8.post("/:id/tasks/:taskId/approve", (req, res) => {
+router8.post("/:id/tasks/:taskId/approve", requireAuth, (req, res) => {
   const task = chatTaskStore.get(req.params["taskId"] ?? "");
-  if (!task) {
+  if (!task || task.serverId !== parseInt(req.params["id"] ?? "0") || task.userId !== res.locals["userId"]) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
@@ -118267,17 +118591,18 @@ router8.post("/:id/tasks/:taskId/approve", (req, res) => {
   chatTaskEmit(task, "think", { text: (approved !== false) ? "\u2705 Command approved \u2014 executing now\u2026" : "\uD83D\uDEAB Command rejected \u2014 skipping." });
   return res.json({ ok: true });
 });
-router8.post("/:id/tasks/:taskId/cancel", (req, res) => {
+router8.post("/:id/tasks/:taskId/cancel", requireAuth, (req, res) => {
   const task = chatTaskStore.get(req.params["taskId"] ?? "");
-  if (!task) {
+  if (!task || task.serverId !== parseInt(req.params["id"] ?? "0") || task.userId !== res.locals["userId"]) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
   task.abort.abort();
   task.status = "cancelled";
+  chatTaskEmit(task, "reply", { text: "Cancelled. Completed work was preserved and this chat is ready for another request." });
   try {
     chatTaskEmit(task, "run_failed", { runId: task.runId, conversationId: task.conversationId, status: "cancelled", reason: "User cancelled" });
-    if (task.runId) pool.query(`UPDATE agent_runs SET status='cancelled', completed_at=NOW() WHERE run_id=$1`, [task.runId]).catch(() => {});
+    if (task.runId) pool.query(`UPDATE agent_runs SET status='cancelled',cancel_requested_at=NOW(),completed_at=NOW(),finished_at=NOW(),heartbeat_at=NOW(),current_step='Stopped by user' WHERE run_id=$1`, [task.runId]).catch(() => {});
   } catch (_ce) {}
   chatTaskEmit(task, "stream_end", {});
   return res.json({ ok: true });
@@ -118785,6 +119110,80 @@ router8.get("/:id/sftp-download", requireAuth, async (req, res) => {
   if (s2.authType === "key" && s2.privateKey) connectOpts["privateKey"] = s2.privateKey;
   else if (s2.password) connectOpts["password"] = s2.password;
   client.connect(connectOpts);
+});
+router8.get("/:id/conversations", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], serverId = parseInt(req.params.id), limit = Math.max(1, Math.min(50, Number(req.query.limit) || 25)), offset = Math.max(0, Number(req.query.offset) || 0), search = String(req.query.search || "").trim();
+  const owned = await pool.query("SELECT id,name FROM servers WHERE id=$1 AND user_id=$2", [serverId, userId]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Not found" });
+  const values = [serverId, userId];
+  let searchSql = "";
+  if (search) { values.push(`%${search}%`); searchSql = ` AND (c.title ILIKE $3 OR c.summary ILIKE $3 OR EXISTS(SELECT 1 FROM conversation_messages m WHERE m.conversation_id=c.id AND m.content ILIKE $3))`; }
+  values.push(limit, offset);
+  const rows = await pool.query(`SELECT c.public_id conversation_id,c.title,c.status,c.summary,c.created_at,c.updated_at,c.last_message_at,
+    (SELECT content FROM conversation_messages m WHERE m.conversation_id=c.id ORDER BY sequence DESC LIMIT 1) preview,
+    (SELECT COUNT(*)::int FROM conversation_messages m WHERE m.conversation_id=c.id) message_count,
+    (SELECT COUNT(*)::int FROM coding_agent_runs r WHERE r.conversation_id=c.id) run_count,
+    (SELECT status FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_run_status,
+    (SELECT GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(r.completed_at,NOW())-r.started_at))*1000)::bigint FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_duration_ms
+    FROM conversations c WHERE c.server_id=$1 AND c.user_id=$2${searchSql} ORDER BY c.last_message_at DESC LIMIT $${values.length-1} OFFSET $${values.length}`, values);
+  res.json({ server: { id: serverId, name: owned.rows[0].name }, items: rows.rows.map((row) => ({ ...row, title: conciseConversationTitle(row.title) })), limit, offset, hasMore: rows.rowCount === limit });
+});
+router8.post("/:id/conversations", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], serverId = parseInt(req.params.id);
+  const owned = await pool.query("SELECT id,name FROM servers WHERE id=$1 AND user_id=$2", [serverId, userId]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Not found" });
+  const publicId = `chat_${randomUUID2().replace(/-/g, "")}`;
+  const row = await pool.query("INSERT INTO conversations(public_id,user_id,title,server_id,status,metadata,last_message_at) VALUES($1,$2,'New chat',$3,'active',$4,NOW()) RETURNING public_id conversation_id,title,server_id,created_at", [publicId, userId, serverId, JSON.stringify({ source: "server-agent-chat" })]);
+  await pool.query("INSERT INTO agent_conversations(conversation_id,server_id,user_id,title,status) VALUES($1,$2,$3,'New chat','active') ON CONFLICT(conversation_id) DO NOTHING", [publicId, serverId, userId]);
+  res.status(201).json({ ...row.rows[0], canonicalUrl: `/servers/${serverId}/chats/${publicId}` });
+});
+router8.get("/:id/conversations/:conversationId", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], serverId = parseInt(req.params.id), limit = Math.max(1, Math.min(100, Number(req.query.limit) || 50)), before = Math.max(1, Math.min(2147483647, Number(req.query.before) || 2147483647));
+  const c = await pool.query("SELECT c.*,s.name server_name,s.host,s.port,s.username FROM conversations c JOIN servers s ON s.id=c.server_id WHERE c.public_id=$1 AND c.server_id=$2 AND c.user_id=$3 AND s.user_id=$3", [req.params.conversationId, serverId, userId]);
+  if (!c.rowCount) return res.status(404).json({ error: "Conversation not found" });
+  const messages = await pool.query("SELECT id message_db_id,public_id,role,content,content_type,sequence,run_id,client_message_id,created_at,token_usage,credit_usage,metadata FROM conversation_messages WHERE conversation_id=$1 AND sequence<$2 ORDER BY sequence DESC LIMIT $3", [c.rows[0].id, before, limit]);
+  const runs = await pool.query(`SELECT r.public_id run_id,r.status,r.phase,r.started_at,r.completed_at,r.heartbeat_at,r.error,r.metadata,
+    NULLIF(r.metadata->>'sourceMessageId','')::bigint trigger_message_id,
+    (SELECT m.public_id FROM conversation_messages m WHERE m.run_id=r.id AND m.role='assistant' ORDER BY sequence DESC LIMIT 1) final_response_message_id,
+    (SELECT COUNT(*)::int FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id AND i.status='completed') completed_tasks,
+    (SELECT COUNT(*)::int FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id) total_tasks,
+    GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(completed_at,NOW())-started_at))*1000)::bigint duration_ms,
+    COALESCE((SELECT SUM(charged_credits) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0) credits_used
+    FROM coding_agent_runs r WHERE conversation_id=$1 ORDER BY id DESC LIMIT 25`, [c.rows[0].id]);
+  const { id: _id, user_id: _uid, ...safe } = c.rows[0];
+  res.json({ ...safe, title: conciseConversationTitle(safe.title), canonicalUrl: `/servers/${serverId}/chats/${req.params.conversationId}`, messages: messages.rows.reverse(), hasMoreMessages: messages.rowCount === limit, runs: runs.rows });
+});
+router8.get("/:id/conversations/:conversationId/runs/:runId/activity", requireAuth, async (req, res) => {
+  const owned = await pool.query("SELECT r.id FROM coding_agent_runs r JOIN conversations c ON c.id=r.conversation_id JOIN servers s ON s.id=c.server_id WHERE r.public_id=$1 AND c.public_id=$2 AND c.server_id=$3 AND c.user_id=$4 AND s.user_id=$4", [req.params.runId, req.params.conversationId, parseInt(req.params.id), res.locals["userId"]]);
+  if (!owned.rowCount) return res.status(404).json({ error: "Run not found" });
+  const [events, tools] = await Promise.all([pool.query("SELECT sequence,type,payload,created_at FROM agent_run_events WHERE run_id=$1 ORDER BY sequence LIMIT 500", [owned.rows[0].id]), pool.query("SELECT public_id,name,status,input,result,duration_ms,started_at,completed_at FROM agent_tool_calls WHERE run_id=$1 ORDER BY id LIMIT 200", [owned.rows[0].id])]);
+  res.json({ events: events.rows, toolCalls: tools.rows });
+});
+router8.get("/:id/conversations/:conversationId/runs/:runId/events", requireAuth, async (req, res) => {
+  const owned = await pool.query("SELECT r.id,r.status FROM coding_agent_runs r JOIN conversations c ON c.id=r.conversation_id JOIN servers s ON s.id=c.server_id WHERE r.public_id=$1 AND c.public_id=$2 AND c.server_id=$3 AND c.user_id=$4 AND s.user_id=$4", [req.params.runId, req.params.conversationId, parseInt(req.params.id), res.locals["userId"]]);
+  if (!owned.rowCount) return res.status(404).end();
+  let cursor = Math.max(0, Number(req.headers["last-event-id"] || req.query.after) || 0), closed = false;
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+  req.on("close", () => { closed = true; });
+  while (!closed) {
+    const events = await pool.query("SELECT sequence,type,payload,created_at FROM agent_run_events WHERE run_id=$1 AND sequence>$2 ORDER BY sequence LIMIT 200", [owned.rows[0].id, cursor]);
+    for (const event of events.rows) {
+      cursor = event.sequence;
+      res.write(`id: ${event.sequence}\nevent: activity\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+    const state = await pool.query("SELECT status FROM coding_agent_runs WHERE id=$1", [owned.rows[0].id]);
+    const runStatus = state.rows[0]?.status;
+    if (["completed","partially_completed","failed","blocked","cancelled"].includes(runStatus)) {
+      res.write(`event: terminal\ndata: ${JSON.stringify({ status: runStatus })}\n\n`);
+      res.end();
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
 });
 router8.get("/:id/history", requireAuth, async (req, res) => {
   const userId = res.locals["userId"];
@@ -123004,6 +123403,27 @@ router27.post("/browser/navigate", requireAuth, async (req, res) => {
     return res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
   }
 });
+router27.post("/terminal/run", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], command = String(req.body?.command ?? ""), cwd = req.body?.cwd ? String(req.body.cwd) : void 0;
+  if (!command) return res.status(400).json({ error: "command required" });
+  if (!isConnected(userId)) return res.status(503).json({ error: "Desktop Bridge disconnected." });
+  try { return res.json({ targetType: "local", targetId: `desktop_${userId}`, result: await sendCommand(userId, "terminal.run", { command, cwd }, 12e4) }); }
+  catch (error) { return res.status(502).json({ error: String(error?.message ?? error), targetType: "local" }); }
+});
+router27.post("/files/read", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], path = String(req.body?.path ?? "");
+  if (!path) return res.status(400).json({ error: "path required" });
+  if (!isConnected(userId)) return res.status(503).json({ error: "Desktop Bridge disconnected." });
+  try { return res.json({ targetType: "local", targetId: `desktop_${userId}`, result: await sendCommand(userId, "file.read", { path }, 3e4) }); }
+  catch (error) { return res.status(502).json({ error: String(error?.message ?? error), targetType: "local" }); }
+});
+router27.post("/files/write", requireAuth, async (req, res) => {
+  const userId = res.locals["userId"], path = String(req.body?.path ?? ""), content = String(req.body?.content ?? "");
+  if (!path) return res.status(400).json({ error: "path required" });
+  if (!isConnected(userId)) return res.status(503).json({ error: "Desktop Bridge disconnected." });
+  try { return res.json({ targetType: "local", targetId: `desktop_${userId}`, result: await sendCommand(userId, "file.write", { path, content }, 3e4) }); }
+  catch (error) { return res.status(502).json({ error: String(error?.message ?? error), targetType: "local" }); }
+});
 router27.post("/browser/click", requireAuth, async (req, res) => {
   const userId = res.locals["userId"];
   const { selector, tabId } = req.body;
@@ -124555,6 +124975,8 @@ router33.use("/v1", v1_meta_default);
 var routes_default = router33;
 
 // src/app.ts
+import { installAgentRuntime, recoverStaleRuns, redactSecrets } from "./agent-runtime.mjs";
+import { installAdminRuntime, recordLoginAttempt } from "./admin-runtime.mjs";
 var app = (0, import_express34.default)();
 app.use(
   (0, import_pino_http.default)({
@@ -124578,6 +125000,8 @@ app.use(
 app.use((0, import_cors.default)());
 app.use(import_express34.default.json({ limit: "50mb" }));
 app.use(import_express34.default.urlencoded({ extended: true, limit: "50mb" }));
+await installAgentRuntime(app, pool);
+await installAdminRuntime(app, pool);
 app.use("/api", routes_default);
 var app_default = app;
 
@@ -124631,6 +125055,7 @@ var httpServer = createServer(app_default);
 attachDesktopBridge(httpServer);
 httpServer.listen(port, async () => {
   logger.info({ port }, "Server listening");
+  await recoverStaleRuns(pool).catch((err) => logger.warn({ err }, "Agent run recovery failed"));
   await seedSuperAdmin();
   scheduleAutolearn();
 });
