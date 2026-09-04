@@ -124555,6 +124555,7 @@ router33.use("/v1", v1_meta_default);
 var routes_default = router33;
 
 // src/app.ts
+import { installAgentRuntime, recoverStaleRuns } from "./agent-runtime.mjs";
 var app = (0, import_express34.default)();
 app.use(
   (0, import_pino_http.default)({
@@ -124578,6 +124579,7 @@ app.use(
 app.use((0, import_cors.default)());
 app.use(import_express34.default.json({ limit: "50mb" }));
 app.use(import_express34.default.urlencoded({ extended: true, limit: "50mb" }));
+await installAgentRuntime(app, pool);
 app.use("/api", routes_default);
 var app_default = app;
 
@@ -124631,6 +124633,7 @@ var httpServer = createServer(app_default);
 attachDesktopBridge(httpServer);
 httpServer.listen(port, async () => {
   logger.info({ port }, "Server listening");
+  await recoverStaleRuns(pool).catch((err) => logger.warn({ err }, "Agent run recovery failed"));
   await seedSuperAdmin();
   scheduleAutolearn();
 });
