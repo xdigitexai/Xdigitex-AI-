@@ -26,7 +26,7 @@ test("workspace supports history, new chat, follow-up, and inline persisted acti
 test("server cards route reliably and execution logs scroll independently", () => {
   assert.match(workspace, /body\.items\|\|body\.servers\|\|body\.data/);
   assert.match(workspace, /\/servers\/\$\{server\.id\}\/conversations/);
-  assert.match(workspace, /max-height:400px/);
+  assert.match(workspace, /max-height:min\(400px,48vh\)/);
   assert.match(workspace, /max-height:45vh/);
   assert.match(workspace, /New activity ↓/);
   assert.match(workspace, /CSS\.escape\(runId\)/);
