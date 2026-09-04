@@ -1,6 +1,7 @@
 import { createRequire as __bannerCrReq } from 'node:module';
 import __bannerPath from 'node:path';
 import __bannerUrl from 'node:url';
+import { semanticTaskKey, normalizeProjectRoot } from './agent-task-identity.mjs';
 
 globalThis.require = __bannerCrReq(import.meta.url);
 globalThis.__filename = __bannerUrl.fileURLToPath(import.meta.url);
@@ -112361,6 +112362,8 @@ async function reserveServerAgentCredits(task, provider, model, iteration) {
 async function settleServerAgentCredits(task, ledger, usage, provider, model) {
   if (!ledger || ledger.status === "settled") return ledger;
   const inputTokens = Number(usage?.prompt_tokens ?? 0), outputTokens = Number(usage?.completion_tokens ?? 0);
+  const cachedTokens = Number(usage?.prompt_tokens_details?.cached_tokens ?? usage?.cached_tokens ?? 0);
+  const reasoningTokens = Number(usage?.completion_tokens_details?.reasoning_tokens ?? usage?.reasoning_tokens ?? 0);
   const deepseek = /deepseek/i.test(`${provider} ${model}`), luna = /luna|gpt-5\.6/i.test(model);
   const inputPrice = deepseek ? 0.27 : luna ? 0.20 : 0.55;
   const outputPrice = deepseek ? 1.10 : luna ? 1.20 : 2.19;
@@ -112376,9 +112379,15 @@ async function settleServerAgentCredits(task, ledger, usage, provider, model) {
     const extra = Math.min(Math.max(0, requestedCredits - 1), available);
     if (extra > 0) await client.query("UPDATE users SET credits=credits-$2,updated_at=NOW() WHERE id=$1", [task.userId, extra]);
     const charged = 1 + extra, after = available - extra;
-    const row = await client.query(`UPDATE agent_usage_ledger SET provider=$2,model=$3,input_tokens=$4,output_tokens=$5,provider_cost=$6,charged_credits=$7,balance_after=$8,status='settled',updated_at=NOW() WHERE id=$1 RETURNING *`, [ledger.id, provider, model, inputTokens, outputTokens, providerCost, charged, after]);
+    const row = await client.query(`UPDATE agent_usage_ledger SET provider=$2,model=$3,input_tokens=$4,output_tokens=$5,cached_tokens=$6,reasoning_tokens=$7,provider_cost=$8,charged_credits=$9,balance_after=$10,status='settled',updated_at=NOW() WHERE id=$1 RETURNING *`, [ledger.id, provider, model, inputTokens, outputTokens, cachedTokens, reasoningTokens, providerCost, charged, after]);
     await client.query("COMMIT");
     task.creditsUsed = (task.creditsUsed ?? 0) + charged;
+    task.inputTokens = (task.inputTokens ?? 0) + inputTokens;
+    task.outputTokens = (task.outputTokens ?? 0) + outputTokens;
+    task.cachedTokens = (task.cachedTokens ?? 0) + cachedTokens;
+    task.reasoningTokens = (task.reasoningTokens ?? 0) + reasoningTokens;
+    task.costUsd = (task.costUsd ?? 0) + providerCost;
+    task.creditsRemaining = after;
     if (charged < requestedCredits || after <= 0) task.creditExhausted = true;
     chatTaskEmit(task, "credits_used", { creditsUsed: task.creditsUsed, balance: after });
     return row.rows[0];
@@ -112412,7 +112421,7 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
     await client.query("SELECT pg_advisory_xact_lock($1)", [conversationDbId]);
     const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1", [conversationDbId])).rows[0].n;
     const message = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,role,content,sequence,metadata) VALUES($1,$2,'user',$3,$4,$5) RETURNING id`, [randomUUID2(), conversationDbId, prompt, sequence, JSON.stringify({ source: "server-agent", serverId: server.id })]);
-    const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username, targetContext })]);
+    const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, triggerMessageId: message.rows[0].id, originalRequest: promptText, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username, targetContext })]);
     task.durableRunDbId = run.rows[0].id; task.durableConversationDbId = conversationDbId;
     await client.query("UPDATE conversation_messages SET run_id=$2 WHERE id=$1", [message.rows[0].id, task.durableRunDbId]);
     const taskItems = /\bdeploy|deployment|nginx|domain|ssl\b/i.test(String(prompt)) ? ["Connect to server", "Inspect current deployment", "Inspect repository and runtime", "Install, build, and start application", "Configure domain and TLS", "Verify production"] : ["Inspect server state", "Perform requested work", "Verify result", "Deliver final report"];
@@ -112442,7 +112451,7 @@ async function bridgeServerAgentRunFinish(task) {
     await client.query("SELECT pg_advisory_xact_lock($1)", [task.durableConversationDbId]);
     const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1", [task.durableConversationDbId])).rows[0].n;
     const final = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,run_id,role,content,sequence,metadata) VALUES($1,$2,$3,'assistant',$4,$5,$6) RETURNING id`, [randomUUID2(), task.durableConversationDbId, task.durableRunDbId, finalText, sequence, JSON.stringify({ final: true, status, filesModified: task.filesModified ?? [] })]);
-    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ finalMessageId: final.rows[0].id, actionCount: task.timeline?.length ?? 0, filesModified: task.filesModified ?? [] })]);
+    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ finalMessageId: final.rows[0].id, actionCount: task.timeline?.length ?? 0, filesModified: task.filesModified ?? [], usage: { inputTokens: task.inputTokens ?? 0, cachedInputTokens: task.cachedTokens ?? 0, outputTokens: task.outputTokens ?? 0, reasoningTokens: task.reasoningTokens ?? 0, totalTokens: (task.inputTokens ?? 0) + (task.outputTokens ?? 0), costUsd: task.costUsd ?? 0, creditsUsed: task.creditsUsed ?? 0, creditsRemaining: task.creditsRemaining ?? null } })]);
     await client.query("UPDATE conversations SET last_message_at=NOW(),updated_at=NOW() WHERE id=$1", [task.durableConversationDbId]);
     await client.query("COMMIT");
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
@@ -112463,6 +112472,24 @@ async function completeRunTask(task, evidence) {
     if (next.rowCount) chatTaskEmit(task, "task_start", { task: next.rows[0].title, position: next.rows[0].position });
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 }
+function formatTerminalRunReport({ message, request, task, durationMs, completedTasks, totalTasks }) {
+  const existing = String(message || "Task completed.").replace(/^\s*STATUS\s*:[^\n]*\n?/im, "").trim();
+  const verified = /status\s*:\s*verified|\bverified\b/i.test(String(message || ""));
+  const ctx = task.targetContext || {};
+  const totalTokens = (task.inputTokens ?? 0) + (task.outputTokens ?? 0);
+  const mins = String(Math.floor(durationMs / 6e4)).padStart(2, "0"), secs = String(Math.floor(durationMs % 6e4 / 1e3)).padStart(2, "0");
+  const lines = [
+    `STATUS: ${verified ? "VERIFIED" : "COMPLETED"}`, "", `REQUEST:\n${String(request || "").slice(0, 1500)}`, "",
+    `TARGET:\n${String(ctx.targetType || "server").toUpperCase()} · ${ctx.serverPublicIp || ctx.host || "Unknown"} · SSH ${ctx.sshPort || ctx.port || "Unknown"}`,
+    ctx.projectName ? `\nPROJECT:\n${ctx.projectName}${ctx.projectRoot ? ` · ${ctx.projectRoot}` : ""}` : "",
+    ctx.domain ? `\nDOMAIN:\nhttps://${ctx.domain}` : "", "",
+    `TASKS:\n${completedTasks} / ${totalTasks} completed`, "", `TIME WORKED:\n${mins}m ${secs}s`, "",
+    `USAGE:\nInput tokens: ${task.inputTokens ?? 0}\nCached input tokens: ${task.cachedTokens ?? 0}\nOutput tokens: ${task.outputTokens ?? 0}\nTotal tokens: ${totalTokens}\nCost: $${Number(task.costUsd ?? 0).toFixed(6)}\nCredits used: ${task.creditsUsed ?? 0}\nCredits remaining: ${task.creditsRemaining ?? "Unavailable"}`,
+    "", `WHAT WAS DONE:\n${existing}`
+  ];
+  if (verified && ctx.domain) lines.push("", `LIVE:\nhttps://${ctx.domain}`);
+  return lines.filter((line) => line !== "").join("\n");
+}
 async function addRunTasks(task, titles, reason) {
   if (!task?.durableTaskDbId || !Array.isArray(titles)) return [];
   const clean = [...new Set(titles.map((title) => String(title).trim()).filter(Boolean))];
@@ -112471,14 +112498,14 @@ async function addRunTasks(task, titles, reason) {
   try {
     await client.query("BEGIN");
     await client.query("SELECT id FROM agent_tasks WHERE id=$1 FOR UPDATE", [task.durableTaskDbId]);
-    const existing = await client.query("SELECT lower(regexp_replace(title,'[^a-z0-9]+','','g')) normalized FROM agent_task_items WHERE task_id=$1", [task.durableTaskDbId]);
-    const keys = new Set(existing.rows.map((row) => row.normalized));
+    const existing = await client.query("SELECT id,title,status,evidence FROM agent_task_items WHERE task_id=$1", [task.durableTaskDbId]);
+    const keys = new Set(existing.rows.map((row) => row.evidence?.taskKey || semanticTaskKey(row.title, task?.targetContext)));
     let position = Number((await client.query("SELECT COALESCE(MAX(position),0) n FROM agent_task_items WHERE task_id=$1", [task.durableTaskDbId])).rows[0].n);
     for (const title of clean) {
-      const key = title.toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const key = semanticTaskKey(title, task?.targetContext);
       if (keys.has(key)) continue;
       position++;
-      await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence) VALUES($1,$2,$3,'pending',$4)", [task.durableTaskDbId, position, title, JSON.stringify({ discovered: true, reason })]);
+      await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence) VALUES($1,$2,$3,'pending',$4)", [task.durableTaskDbId, position, title, JSON.stringify({ discovered: true, reason, taskKey: key, attemptCount: 0 })]);
       keys.add(key); added.push({ title, position, status: "pending" });
     }
     await client.query("COMMIT");
@@ -112489,11 +112516,12 @@ async function addRunTasks(task, titles, reason) {
 async function reconcileRunDiscoveries(task, output) {
   const text = String(output || "");
   const discovered = {};
-  const projectRoot = text.match(/(?:^|\s)(\/(?:var\/www|home|opt)\/[\w./-]+)/m)?.[1];
+  const projectName = String(task?.targetContext?.projectName || "");
+  const projectRoot = normalizeProjectRoot(text, projectName);
   const listen = text.match(/\b(127\.0\.0\.1|0\.0\.0\.0|localhost|\[::\]|::):(\d{2,5})\b/i);
   const appPort = listen?.[2] ?? text.match(/\b(?:PORT|port)\s*[=:]\s*(\d{2,5})\b/i)?.[1];
   const processName = text.match(/(?:pm2[^\n]*|name[^\n]*?)\b([a-z0-9][a-z0-9_-]*(?:airtel|starlink)[a-z0-9_-]*)\b/i)?.[1];
-  if (projectRoot) discovered.projectRoot = projectRoot.replace(/[,:;]+$/, "");
+  if (projectRoot) discovered.projectRoot = projectRoot;
   if (appPort) discovered.appPort = Number(appPort);
   if (listen) discovered.appBind = listen[1].toLowerCase() === "localhost" ? "127.0.0.1" : listen[1];
   if (processName) discovered.processName = processName;
@@ -116409,11 +116437,12 @@ Tell the user to check that the agent script is still running in their terminal 
       const commandResultCache = /* @__PURE__ */ new Map();
       const unresolvedCommandFailures = /* @__PURE__ */ new Set();
       let mutationEpoch = 0;
-      let budgetFinalizationRequested = false;
+      let lastSoftBudgetSignal = -1;
       const originalUserMessage = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
       const taskComplexity = simpleTaskFastPath ? "simple" : /\b(rebuild|migrate|architecture|entire|full|multiple|complete system)\b/i.test(originalUserMessage) ? "complex" : /\b(deploy|install|implement|redesign|integrate)\b/i.test(originalUserMessage) ? "moderate" : "simple";
-      const maxIterations = taskComplexity === "complex" ? 40 : taskComplexity === "moderate" ? 24 : 10;
-      const maxCommands = taskComplexity === "complex" ? 80 : taskComplexity === "moderate" ? 40 : 12;
+      const maxIterations = taskComplexity === "complex" ? 60 : taskComplexity === "moderate" ? 40 : 16;
+      let softCommandBudget = taskComplexity === "complex" ? 80 : taskComplexity === "moderate" ? 40 : 12;
+      const hardCommandLimit = taskComplexity === "complex" ? 180 : taskComplexity === "moderate" ? 100 : 36;
       const homeDir = s2.username === "root" ? "/root" : `/home/${s2.username}`;
       let currentRole = "task_manager";
       let consecutiveFailBatches = 0;
@@ -116498,15 +116527,19 @@ Tell the user to check that the agent script is still running in their terminal 
       };
       let hasAddedMaxStepsWarning = false;
       for (let iter = 0; iter < maxIterations; iter++) {
-        if (totalCommands >= maxCommands) {
-          if (!budgetFinalizationRequested) {
-            budgetFinalizationRequested = true;
-            aiMessages.push({ role: "user", content: `[RUN-WIDE COMMAND BUDGET REACHED]\nDo not run more tools or restart planning. Evaluate the authoritative original request against facts already collected. If satisfied, respond action="done" with a concise completed/verified report. Otherwise respond action="done" with STATUS: PARTIALLY VERIFIED and only the genuinely unresolved requirement.` });
-          } else {
+        if (totalCommands >= softCommandBudget && totalCommands > lastSoftBudgetSignal) {
+          const repeatedFailure = consecutiveFailBatches >= 3 || [...cmdRunCount.values()].some((count) => count >= 3);
+          if (totalCommands >= hardCommandLimit && repeatedFailure) {
             task.status = "partially_completed";
-            send2("reply", { text: "Partially completed. The run-wide command budget was reached and required work remains. Completed work was preserved." });
+            send2("reply", { text: "Partially completed. A hard loop guard stopped repeated equivalent failures. Completed work and remaining acceptance criteria were preserved." });
             break;
           }
+          const previousBudget = softCommandBudget;
+          softCommandBudget = Math.min(hardCommandLimit, softCommandBudget + (taskComplexity === "complex" ? 40 : taskComplexity === "moderate" ? 25 : 12));
+          lastSoftBudgetSignal = totalCommands;
+          const remaining = task.durableTaskDbId ? await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress') ORDER BY position", [task.durableTaskDbId]) : { rows: [] };
+          aiMessages.push({ role: "user", content: `[SOFT EFFICIENCY BUDGET]\n${totalCommands} commands reached the efficiency threshold (${previousBudget}); this is not a completion condition. Compact context, discard redundant actions, reuse cached target/project facts, and continue only the smallest actions needed for these remaining criteria:\n${remaining.rows.map((row) => `- ${row.title}`).join("\n") || "- Re-evaluate the original request and verification evidence"}\nOnly stop for a demonstrated repeated loop, unsafe mutation, executor failure, external blocker, or insufficient credits.` });
+          chatTaskEmit(task, "status", { text: "Compacting run context and continuing remaining work" });
         }
         if (aiMessages.length > 14) {
           const recent = aiMessages.slice(-10).map((message) => ({ ...message, content: String(message.content ?? "").slice(0, 6000) }));
@@ -117093,7 +117126,7 @@ Retry your task using the cPanel actions above.`
         }
         if (action.action === "run" && Array.isArray(action.commands) && action.commands.length) {
           const cmds = action.commands.filter((c) => c && typeof c.cmd === "string").slice(0, 10);
-          if (totalCommands + cmds.length > maxCommands) cmds.splice(Math.max(0, maxCommands - totalCommands));
+          if (totalCommands + cmds.length > softCommandBudget) cmds.splice(Math.max(1, softCommandBudget - totalCommands));
           totalCommands += cmds.length;
           const normCmd = (c) => c.replace(/\s+/g, " ").trim();
           const repeatCmds = cmds.filter((c) => (cmdRunCount.get(normCmd(c.cmd)) ?? 0) >= 1);
@@ -118496,8 +118529,11 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
             }
             continue;
           }
-          await flushTokens(action.message);
-          send2("done", { text: action.message ?? "Task completed." });
+          const taskCounts = task.durableTaskDbId ? await pool.query("SELECT COUNT(*) FILTER (WHERE status='completed')::int completed,COUNT(*)::int total FROM agent_task_items WHERE task_id=$1", [task.durableTaskDbId]) : { rows: [{ completed: 0, total: 0 }] };
+          const finalReport = formatTerminalRunReport({ message: action.message, request: originalUserMessage, task, durationMs: Date.now() - startTime, completedTasks: taskCounts.rows[0]?.completed ?? 0, totalTasks: taskCounts.rows[0]?.total ?? 0 });
+          action.message = finalReport;
+          await flushTokens(finalReport);
+          send2("done", { text: finalReport });
 
           // ── XD Save as Automation ────────────────────────────────
           try {
@@ -119243,7 +119279,8 @@ router8.get("/:id/conversations", requireAuth, async (req, res) => {
     (SELECT COUNT(*)::int FROM conversation_messages m WHERE m.conversation_id=c.id) message_count,
     (SELECT COUNT(*)::int FROM coding_agent_runs r WHERE r.conversation_id=c.id) run_count,
     (SELECT status FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_run_status,
-    (SELECT GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(r.completed_at,NOW())-r.started_at))*1000)::bigint FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_duration_ms
+    (SELECT GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(r.completed_at,NOW())-r.started_at))*1000)::bigint FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_duration_ms,
+    (SELECT COALESCE(SUM(u.charged_credits),0) FROM coding_agent_runs r LEFT JOIN agent_usage_ledger u ON u.run_id=r.id AND u.status='settled' WHERE r.conversation_id=c.id GROUP BY r.id ORDER BY r.id DESC LIMIT 1) latest_credits_used
     FROM conversations c WHERE c.server_id=$1 AND c.user_id=$2${searchSql} ORDER BY c.last_message_at DESC LIMIT $${values.length-1} OFFSET $${values.length}`, values);
   res.json({ server: { id: serverId, name: owned.rows[0].name }, items: rows.rows.map((row) => ({ ...row, title: conciseConversationTitle(row.title) })), limit, offset, hasMore: rows.rowCount === limit });
 });
@@ -119269,7 +119306,12 @@ router8.get("/:id/conversations/:conversationId", requireAuth, async (req, res) 
     (SELECT i.title FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id AND i.status='in_progress' ORDER BY i.position LIMIT 1) current_step,
     COALESCE((SELECT json_agg(json_build_object('id',i.id,'position',i.position,'title',i.title,'status',i.status,'evidence',i.evidence) ORDER BY i.position) FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id),'[]'::json) todo_items,
     GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(completed_at,NOW())-started_at))*1000)::bigint duration_ms,
-    COALESCE((SELECT SUM(charged_credits) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0) credits_used
+    COALESCE((SELECT SUM(charged_credits) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0) credits_used,
+    COALESCE((SELECT SUM(input_tokens) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0)::bigint input_tokens,
+    COALESCE((SELECT SUM(cached_tokens) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0)::bigint cached_input_tokens,
+    COALESCE((SELECT SUM(output_tokens) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0)::bigint output_tokens,
+    COALESCE((SELECT SUM(provider_cost) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0)::numeric cost_usd,
+    (SELECT balance_after FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled' ORDER BY u.id DESC LIMIT 1) credits_remaining
     FROM coding_agent_runs r WHERE conversation_id=$1 ORDER BY id DESC LIMIT 25`, [c.rows[0].id]);
   const { id: _id, user_id: _uid, ...safe } = c.rows[0];
   res.json({ ...safe, title: conciseConversationTitle(safe.title), canonicalUrl: `/servers/${serverId}/chats/${req.params.conversationId}`, messages: messages.rows.reverse(), hasMoreMessages: messages.rowCount === limit, runs: runs.rows });

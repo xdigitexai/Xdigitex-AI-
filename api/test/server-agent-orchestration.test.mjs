@@ -11,7 +11,8 @@ test("non-streaming planner does not reference an undeclared transport stream", 
 
 test("server agent applies bounded cycle and command budgets", () => {
   assert.match(source, /const maxIterations = taskComplexity/);
-  assert.match(source, /const maxCommands = taskComplexity/);
+  assert.match(source, /let softCommandBudget = taskComplexity/);
+  assert.match(source, /const hardCommandLimit = taskComplexity/);
   assert.match(source, /No-progress loop detected/);
 });
 
@@ -40,10 +41,11 @@ test("read-only command results are cached until a successful mutation", () => {
   assert.match(source, /mutationEpoch\+\+/);
 });
 
-test("budget exhaustion requests completion evaluation before partial status", () => {
-  assert.match(source, /RUN-WIDE COMMAND BUDGET REACHED/);
-  assert.match(source, /If satisfied, respond action="done"/);
-  assert.match(source, /budgetFinalizationRequested/);
+test("soft budget compacts and continues while hard guard requires loop evidence", () => {
+  assert.match(source, /SOFT EFFICIENCY BUDGET/);
+  assert.match(source, /this is not a completion condition/);
+  assert.match(source, /totalCommands >= hardCommandLimit && repeatedFailure/);
+  assert.doesNotMatch(source, /run-wide command budget was reached and required work remains/i);
 });
 
 test("canonical server chat routes validate user and server ownership", () => {
@@ -100,7 +102,8 @@ test("timeouts are task-aware and distinct from generic failures", () => {
 
 test("discoveries expand the persisted TODO without duplicates", () => {
   assert.match(source, /async function addRunTasks\(task, titles, reason\)/);
-  assert.match(source, /lower\(regexp_replace\(title/);
+  assert.match(source, /import \{ semanticTaskKey, normalizeProjectRoot \}/);
+  assert.match(source, /evidence\?\.taskKey/);
   assert.match(source, /Application database requirement detected/);
   assert.match(source, /Configure application DATABASE_URL/);
   assert.match(source, /todo_discovered: "todo\.created"/);
@@ -116,6 +119,7 @@ test("run target context persists safe project metadata", () => {
   assert.match(source, /discovered\.appBind/);
   assert.match(source, /discovered\.packageManager/);
   assert.match(source, /PROFESSIONAL DEPLOYMENT CONTRACT/);
+  assert.match(source, /normalizeProjectRoot\(text, projectName\)/);
   assert.match(source, /!\["github\.com", "www\.github\.com"\]\.includes/);
   assert.match(source, /todo_items,/);
 });

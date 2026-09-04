@@ -59,4 +59,7 @@ test("run card renders authoritative TODO and target context", () => {
   assert.match(workspace, /Database:/);
   assert.match(workspace, /event\.type==="todo\.created"/);
   assert.match(workspace, /event\.type==="target\.updated"/);
+  assert.match(workspace, /Tokens:/);
+  assert.match(workspace, /Cost:/);
+  assert.match(workspace, /credits_remaining/);
 });
