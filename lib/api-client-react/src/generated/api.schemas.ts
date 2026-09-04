@@ -858,3 +858,13 @@ search?: string;
 limit?: number;
 };
 
+export type AgentRunStatus = 'queued' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled' | 'insufficient_credits';
+export interface AgentRun { public_id: string; status: AgentRunStatus; phase: string; events?: Record<string, unknown>[]; tasks?: Record<string, unknown>[]; toolCalls?: Record<string, unknown>[]; checkpoints?: Record<string, unknown>[]; }
+export interface Conversation { public_id: string; title: string; status: 'active' | 'archived'; project_id?: number | null; server_id?: number | null; last_message_at?: string; messages?: Record<string, unknown>[]; runs?: AgentRun[]; }
+export interface ConversationPage { items: Conversation[]; limit: number; offset: number; hasMore: boolean; }
+export interface AgentRunEnvelope { message?: Record<string, unknown>; run?: AgentRun; duplicate?: boolean; }
+export type ListConversationsParams = { search?: string; status?: 'active' | 'archived'; projectId?: number; serverId?: number; limit?: number; offset?: number; };
+export type CreateConversationBody = { title?: string; projectId?: number; serverId?: number; workspaceId?: string; };
+export type CreateConversationMessageBody = { content: string; continueFromRunId?: string; };
+export type ContinueAgentRunBody = { mode?: 'continue' | 'retry'; };
+

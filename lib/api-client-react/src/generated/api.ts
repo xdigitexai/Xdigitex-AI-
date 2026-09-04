@@ -38,6 +38,14 @@ import type {
   ApiKeyCreated,
   ApiKeyInput,
   AuditLog,
+  AgentRun,
+  AgentRunEnvelope,
+  Conversation,
+  ConversationPage,
+  ContinueAgentRunBody,
+  CreateConversationBody,
+  CreateConversationMessageBody,
+  ListConversationsParams,
   AuthResponse,
   BillingOverview,
   BotAnalytics,
@@ -5859,6 +5867,19 @@ export function useAdminGetSystemHealth<TData = Awaited<ReturnType<typeof adminG
 
   return { ...query, queryKey: queryOptions.queryKey };
 }
+
+// Durable coding-agent API (generated contract additions).
+const agentQuery = (params?: Record<string, unknown>) => { const q = new URLSearchParams(); Object.entries(params ?? {}).forEach(([k,v]) => v !== undefined && q.set(k, String(v))); return q.size ? `?${q}` : ''; };
+export const listConversations = (params?: ListConversationsParams, options?: RequestInit) => customFetch<ConversationPage>(`/api/conversations${agentQuery(params)}`, { ...options, method: 'GET' });
+export const createConversation = (body: CreateConversationBody, options?: RequestInit) => customFetch<Conversation>('/api/conversations', { ...options, method: 'POST', headers: { 'Content-Type': 'application/json', ...options?.headers }, body: JSON.stringify(body) });
+export const getConversation = (conversationId: string, options?: RequestInit) => customFetch<Conversation>(`/api/conversations/${conversationId}`, { ...options, method: 'GET' });
+export const updateConversation = (conversationId: string, body: Partial<Pick<Conversation, 'title' | 'status'>>, options?: RequestInit) => customFetch<Conversation>(`/api/conversations/${conversationId}`, { ...options, method: 'PATCH', headers: { 'Content-Type': 'application/json', ...options?.headers }, body: JSON.stringify(body) });
+export const deleteConversation = (conversationId: string, options?: RequestInit) => customFetch<void>(`/api/conversations/${conversationId}`, { ...options, method: 'DELETE' });
+export const createConversationMessage = (conversationId: string, body: CreateConversationMessageBody, idempotencyKey: string, options?: RequestInit) => customFetch<AgentRunEnvelope>(`/api/conversations/${conversationId}/messages`, { ...options, method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey, ...options?.headers }, body: JSON.stringify(body) });
+export const getActiveConversationRun = (conversationId: string, options?: RequestInit) => customFetch<AgentRun | null>(`/api/conversations/${conversationId}/active-run`, { ...options, method: 'GET' });
+export const getAgentRun = (runId: string, options?: RequestInit) => customFetch<AgentRun>(`/api/runs/${runId}`, { ...options, method: 'GET' });
+export const cancelAgentRun = (runId: string, options?: RequestInit) => customFetch<AgentRun>(`/api/runs/${runId}/cancel`, { ...options, method: 'POST' });
+export const continueAgentRun = (runId: string, body: ContinueAgentRunBody, idempotencyKey: string, options?: RequestInit) => customFetch<AgentRun>(`/api/runs/${runId}/continue`, { ...options, method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey, ...options?.headers }, body: JSON.stringify(body) });
 
 
 
