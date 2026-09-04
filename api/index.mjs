@@ -119174,6 +119174,7 @@ router8.get("/:id/conversations/:conversationId", requireAuth, async (req, res) 
     (SELECT m.public_id FROM conversation_messages m WHERE m.run_id=r.id AND m.role='assistant' ORDER BY sequence DESC LIMIT 1) final_response_message_id,
     (SELECT COUNT(*)::int FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id AND i.status='completed') completed_tasks,
     (SELECT COUNT(*)::int FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id) total_tasks,
+    (SELECT i.title FROM agent_task_items i JOIN agent_tasks t ON t.id=i.task_id WHERE t.run_id=r.id AND i.status='in_progress' ORDER BY i.position LIMIT 1) current_step,
     GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(completed_at,NOW())-started_at))*1000)::bigint duration_ms,
     COALESCE((SELECT SUM(charged_credits) FROM agent_usage_ledger u WHERE u.run_id=r.id AND u.status='settled'),0) credits_used
     FROM coding_agent_runs r WHERE conversation_id=$1 ORDER BY id DESC LIMIT 25`, [c.rows[0].id]);
