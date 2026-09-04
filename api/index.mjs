@@ -109191,7 +109191,7 @@ var import_multer = __toESM(require_multer(), 1);
 import path3 from "path";
 
 // src/lib/memory.ts
-async function searchExperiences(query, limit2 = 4) {
+async function searchExperiences(query, limit2 = 4, serverId = null) {
   if (!query.trim()) return [];
   const words = query.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((w) => w.length > 3).slice(0, 10);
   if (words.length === 0) return [];
@@ -109202,8 +109202,12 @@ async function searchExperiences(query, limit2 = 4) {
       or lower(${agentExperiencesTable.category}) like ${"%" + w + "%"})`
   );
   try {
-    const rows = await db.select().from(agentExperiencesTable).where(sql`${likeConditions.reduce((a, b) => sql`${a} or ${b}`)}`).orderBy(desc(agentExperiencesTable.score), desc(agentExperiencesTable.successCount)).limit(limit2);
-    return rows;
+    const rows = await db.select().from(agentExperiencesTable).where(sql`(${likeConditions.reduce((a, b) => sql`${a} or ${b}`)}) AND ${agentExperiencesTable.score} >= 70 AND (${agentExperiencesTable.serverId} IS NULL OR ${agentExperiencesTable.serverId} = ${serverId})`).orderBy(desc(agentExperiencesTable.score), desc(agentExperiencesTable.successCount)).limit(limit2 * 3);
+    const queryWords = new Set(words);
+    return rows.filter((row) => {
+      const haystack = `${row.keywords ?? ""} ${row.problem ?? ""} ${row.category ?? ""}`.toLowerCase();
+      return [...queryWords].filter((word) => haystack.includes(word)).length >= 2;
+    }).slice(0, limit2);
   } catch {
     return [];
   }
@@ -116029,7 +116033,7 @@ void (async () => {
       const browserStatus = await browserProbeResult;
       const userTaskText = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
       const [pastExperiences, knowledgeResult] = await Promise.all([
-        searchExperiences(userTaskText, 4).catch(() => []),
+        searchExperiences(userTaskText, 3, s2.id).catch(() => []),
         buildKnowledgeBlock(userTaskText).catch(() => ({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }))
       ]);
       const memoryBlock = formatMemoryBlock(pastExperiences);
@@ -116131,6 +116135,7 @@ Tell the user to check that the agent script is still running in their terminal 
       let totalPromptTokens = 0;
       let totalCompletionTokens = 0;
       let totalIterations = 0;
+      let totalCommands = 0;
       let doneAttempts = 0;
       let hasBrowsed = false;
       let consecutiveVerifyOnlyIters = 0;
@@ -116236,7 +116241,11 @@ Tell the user to check that the agent script is still running in their terminal 
         }
       };
       const cmdRunCount = /* @__PURE__ */ new Map();
+      const commandResultCount = /* @__PURE__ */ new Map();
       const originalUserMessage = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
+      const taskComplexity = /\b(rebuild|migrate|architecture|entire|full|multiple|complete system)\b/i.test(originalUserMessage) ? "complex" : /\b(add|update|fix|deploy|install|implement|redesign)\b/i.test(originalUserMessage) ? "moderate" : "simple";
+      const maxIterations = taskComplexity === "complex" ? 40 : taskComplexity === "moderate" ? 24 : 12;
+      const maxCommands = taskComplexity === "complex" ? 80 : taskComplexity === "moderate" ? 40 : 20;
       const homeDir = s2.username === "root" ? "/root" : `/home/${s2.username}`;
       let currentRole = "task_manager";
       let consecutiveFailBatches = 0;
@@ -116320,7 +116329,16 @@ Tell the user to check that the agent script is still running in their terminal 
         }
       };
       let hasAddedMaxStepsWarning = false;
-      for (let iter = 0; iter < 80; iter++) {
+      for (let iter = 0; iter < maxIterations; iter++) {
+        if (totalCommands >= maxCommands) {
+          task.status = "partially_completed";
+          send2("reply", { text: `Partially completed.\n\nThe ${taskComplexity} task reached its ${maxCommands}-command safety budget. Completed work was preserved; review Task History before continuing.` });
+          break;
+        }
+        if (aiMessages.length > 14) {
+          const recent = aiMessages.slice(-10).map((message) => ({ ...message, content: String(message.content ?? "").slice(0, 6000) }));
+          aiMessages.splice(1, aiMessages.length - 1, { role: "user", content: `[COMPACT RUN CONTEXT]\nOriginal request: ${originalUserMessage.slice(0, 1200)}\nCompleted commands: ${totalCommands}. Current role: ${currentRole}. Continue from the latest results below; do not repeat prior inspection.` }, ...recent);
+        }
         // ── Check for new user messages injected via chat intercept ──
         if (task.newUserMessages && task.newUserMessages.length > 0) {
           const _newMsg = task.newUserMessages.shift();
@@ -116722,9 +116740,9 @@ After fixing, verify the file works, then action="done".`
           }
           throw lastErr;
         };
-        if (!hasAddedMaxStepsWarning && iter >= 74) {
+        if (!hasAddedMaxStepsWarning && iter >= maxIterations - 4) {
           hasAddedMaxStepsWarning = true;
-          const remaining = 80 - iter;
+          const remaining = maxIterations - iter;
           aiMessages.push({
             role: "user",
             content: [
@@ -116742,7 +116760,7 @@ After fixing, verify the file works, then action="done".`
               `This constraint overrides all other instructions. Finalize and done.`
             ].join("\n")
           });
-          send2("think", { text: `\u26A0\uFE0F Step limit approaching (iter ${iter}/80) \u2014 wrap-up signal injected` });
+          send2("think", { text: `\u26A0\uFE0F Step limit approaching (iter ${iter}/${maxIterations}) \u2014 wrap-up signal injected` });
         }
         const creditLedger = await reserveServerAgentCredits(task, iterProvider, iterModel, iter + 1);
         if (!creditLedger) {
@@ -116752,7 +116770,6 @@ After fixing, verify the file works, then action="done".`
           send2("run_blocked", { runId: task.runId, conversationId: task.conversationId, status: "blocked", reason: "Insufficient credits" });
           break;
         }
-        activeStream = stream;
         const completion = await callWithRetry();
         await settleServerAgentCredits(task, creditLedger, completion.usage, iterProvider, iterModel);
         if (completion.usage) {
@@ -116903,6 +116920,8 @@ Retry your task using the cPanel actions above.`
         }
         if (action.action === "run" && Array.isArray(action.commands) && action.commands.length) {
           const cmds = action.commands.filter((c) => c && typeof c.cmd === "string").slice(0, 10);
+          if (totalCommands + cmds.length > maxCommands) cmds.splice(Math.max(0, maxCommands - totalCommands));
+          totalCommands += cmds.length;
           const normCmd = (c) => c.replace(/\s+/g, " ").trim();
           const repeatCmds = cmds.filter((c) => (cmdRunCount.get(normCmd(c.cmd)) ?? 0) >= 1);
           const allRepeats = repeatCmds.length === cmds.length;
@@ -117014,6 +117033,15 @@ ${out}
             break;
           }
           const resultText = cmdResults.join("\n\n\u2500\u2500\u2500\u2500\u2500\n\n");
+          const resultHash = createHash("sha256").update(resultText).digest("hex").slice(0, 16);
+          const resultKey = `${cmds.map((c) => normCmd(c.cmd)).join("|")}::${resultHash}`;
+          const unchangedCount = (commandResultCount.get(resultKey) ?? 0) + 1;
+          commandResultCount.set(resultKey, unchangedCount);
+          if (unchangedCount >= 2) {
+            task.status = "partially_completed";
+            send2("reply", { text: "Partially completed.\n\nNo-progress loop detected: equivalent commands returned unchanged results twice. Completed work was preserved." });
+            break;
+          }
           aiMessages.push({ role: "assistant", content: raw });
           const allFailed = cmds.length > 0 && cmdResults.every((r2) => /\[exit [^0]/.test(r2));
           const anySucceeded = cmdResults.some((r2) => /\[exit 0\]/.test(r2));
@@ -118298,11 +118326,12 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
           break;
         }
       }
-      await flushTokens("Max iterations reached").catch(() => {
+      await flushTokens(`Run finished after ${totalIterations} model cycles and ${totalCommands} commands`).catch(() => {
       });
     } catch (err) {
       if (task.status !== "blocked" && task.status !== "cancelled") task.status = "failed";
       const rawMsg = String(err instanceof Error ? err.message : err);
+      console.error("[server-agent-runtime]", { errorName: err instanceof Error ? err.name : typeof err, message: rawMsg, stack: err instanceof Error ? err.stack : undefined, runId: task.runId, conversationId: task.conversationId });
       const userMsg = (() => {
         const m2 = rawMsg.toLowerCase();
         if (m2.includes("failed to fetch") || m2.includes("fetch failed") || m2.includes("econnrefused") || m2.includes("enotfound") || m2.includes("network") || m2.includes("connection error") || m2.includes("socket")) return "\u26A0\uFE0F Unable to reach AI service \u2014 please try again in a moment.";
@@ -118310,7 +118339,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
         if (m2.includes("429") || m2.includes("rate limit") || m2.includes("quota")) return "\u26A0\uFE0F AI service is busy \u2014 please wait a moment and try again.";
         if (m2.includes("timed out") || m2.includes("timeout") || m2.includes("aborted")) return "\u26A0\uFE0F AI service timed out \u2014 the server may be under heavy load. Please try again.";
         if (m2.includes("context") && m2.includes("length")) return "\u26A0\uFE0F Request too long \u2014 please start a new conversation or shorten your message.";
-        return rawMsg;
+        return "Internal agent runtime error.";
       })();
       send2("error", { text: userMsg });
       if (!task.lastReply) send2("reply", { text: `Failed.\n\nReason:\n${userMsg}\n\nCompleted work, if any, has been preserved.` });
