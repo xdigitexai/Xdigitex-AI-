@@ -22,3 +22,13 @@ test("workspace supports history, new chat, follow-up, and inline persisted acti
   assert.match(workspace, /PATH\\s\+\[ABC\]/);
   assert.doesNotMatch(workspace, /completed · completed/);
 });
+
+test("server cards route reliably and execution logs scroll independently", () => {
+  assert.match(workspace, /body\.items\|\|body\.servers\|\|body\.data/);
+  assert.match(workspace, /location\.assign\(`\/servers\/\$\{server\.id\}\/chats`\)/);
+  assert.match(workspace, /max-height:400px/);
+  assert.match(workspace, /max-height:45vh/);
+  assert.match(workspace, /New activity ↓/);
+  assert.match(workspace, /CSS\.escape\(runId\)/);
+  assert.match(workspace, /replace\(\/\\uFFFD\/g/);
+});

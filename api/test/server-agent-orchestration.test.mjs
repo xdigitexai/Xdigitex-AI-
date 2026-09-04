@@ -59,3 +59,11 @@ test("message idempotency and final-response hygiene protect chat UX", () => {
   assert.match(source, /Preparing the final response/);
   assert.match(source, /conciseConversationTitle/);
 });
+
+test("domain-bound tasks verify the hostname instead of the SSH address", () => {
+  assert.match(source, /\[DOMAIN TARGET BINDING\]/);
+  assert.match(source, /raw IP does not mean the requested domain failed/);
+  assert.match(source, /curl --resolve/);
+  assert.match(source, /grep -nF/);
+  assert.match(source, /Automation was not requested/);
+});

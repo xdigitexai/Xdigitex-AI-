@@ -116085,6 +116085,10 @@ void (async () => {
       const browserStatus = await browserProbeResult;
       const userTaskText = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
       const explicitTargetMatch = userTaskText.match(/(?:^|\s)([a-z0-9.-]+\/[^\s,;]+\.(?:php|html?|css|js|ts|tsx|jsx|py|rb|go|java))(?:\s|,|;|$)/i);
+      const requestedUrlMatch = userTaskText.match(/https?:\/\/((?:[a-z0-9-]+\.)+[a-z]{2,})(\/[^\s,;]*)?/i);
+      const requestedDomainPathMatch = userTaskText.match(/\b((?:[a-z0-9-]+\.)+[a-z]{2,})(\/[^\s,;]*)?/i);
+      const requestedDomain = (requestedUrlMatch?.[1] ?? requestedDomainPathMatch?.[1] ?? "").toLowerCase();
+      const requestedWebPath = requestedUrlMatch?.[2] ?? requestedDomainPathMatch?.[2] ?? "/";
       const simpleTaskFastPath = !!explicitTargetMatch && /\b(add|change|edit|replace|remove|rename|fix|check)\b/i.test(userTaskText) && !/\b(database|migration|schema|multiple|entire|full system|architecture|rebuild)\b/i.test(userTaskText);
       const [pastExperiences, knowledgeResult] = await Promise.all([
         simpleTaskFastPath ? Promise.resolve([]) : searchExperiences(userTaskText, 3, s2.id).catch(() => []),
@@ -116146,6 +116150,7 @@ void (async () => {
         { role: "system", content: xd_finalSysPrompt },
         ...parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content }))
       ];
+      if (requestedDomain) aiMessages.push({ role: "user", content: `[DOMAIN TARGET BINDING]\nSSH execution target: ${s2.username}@${s2.host}:${s2.port}. Website target: https://${requestedDomain}${requestedWebPath}. These are different identities: the server IP can serve a default virtual host and an HTTP 403 from the raw IP does not mean the requested domain failed. The expected project root is /home/${s2.username}/${requestedDomain}; stay inside that root unless direct evidence proves a different document root. Search requested literals with grep -nF, not regex grep. Verify the hostname URL first; if DNS routing is unavailable, use curl --resolve ${requestedDomain}:443:${s2.host} https://${requestedDomain}${requestedWebPath}. A login redirect can be valid behavior. For a small source change, exact source/literal evidence plus the relevant syntax check is sufficient; a browser screenshot is optional and its absence must not force PARTIAL. Once the requested state and relevant verification pass, emit done immediately without extra discovery commands.` });
       if (simpleTaskFastPath) aiMessages.push({ role: "user", content: `[SIMPLE TASK FAST PATH]\nOriginal request (authoritative): ${userTaskText.slice(0, 1200)}\nExact target: ${explicitTargetMatch[1]}\nInspect this exact source file first. If the requested state already exists, do not edit it: run one relevant syntax check, verify the requested meaning, then finish. Otherwise make only the requested change, run one relevant syntax check, optionally perform at most one live visual check, then finish. Do not scan the project, read generated caches/vendor/node_modules, invent optional requirements, or restart planning.` });
       {
         const bridgeNowConnected = isConnected(s2.userId);
@@ -118333,7 +118338,7 @@ After curl confirms HTTP 200 and real HTML content \u2192 action="done" STATUS: 
               continue;
             }
           }
-          if (isComplexTask && !hasVerification && doneAttempts < 3) {
+          if (!requestedDomain && isComplexTask && !hasVerification && doneAttempts < 3) {
             doneAttempts++;
             if (typeof xd_verPlan !== "undefined" && xd_verPlan && xd_verPlan.missionBlock && doneAttempts === 1) {
               var _vpNames = xd_verPlan.profiles.map(function(m){return m.profile.meta.name;}).join(", ");
@@ -118377,6 +118382,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
 
           // ── XD Save as Automation ────────────────────────────────
           try {
+            if (!/\b(?:save|create|capture)\b.{0,30}\bautomation\b|\bautomate\b/i.test(userTask)) throw new Error("Automation was not requested");
             const xd_st = (userTask + " " + doneMsg).toLowerCase();
             const xd_ac = (() => {
               if (/paystack|stripe|payment|checkout|gateway|mpesa|flutterwave/.test(xd_st)) return "api";
