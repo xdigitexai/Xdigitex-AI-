@@ -112393,7 +112393,7 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
   if (!task.userId) return;
   const promptText = String(prompt || "");
   const repository = promptText.match(/https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)/i)?.[1]?.replace(/\.git$/i, "") ?? null;
-  const domain = promptText.match(/\b((?:[a-z0-9-]+\.)+[a-z]{2,})(?:\/|\b)/i)?.[1]?.toLowerCase() ?? null;
+  const domain = [...promptText.matchAll(/\b((?:[a-z0-9-]+\.)+[a-z]{2,})(?:\/|\b)/ig)].map((match) => match[1].toLowerCase()).find((value) => !["github.com", "www.github.com"].includes(value)) ?? null;
   const targetContext = { targetType: server.cpanelUrl || Number(server.port) !== 22 ? "cpanel" : "vps", targetId: server.id, serverId: server.id, host: server.host, port: server.port, username: server.username, projectName: repository?.split("/").pop() ?? null, repository, domain };
   const client = await pool.connect();
   try {

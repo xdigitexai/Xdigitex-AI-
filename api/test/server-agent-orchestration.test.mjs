@@ -111,5 +111,6 @@ test("run target context persists safe project metadata", () => {
   assert.match(source, /const targetContext = \{ targetType:/);
   assert.match(source, /target_context: "target\.updated"/);
   assert.match(source, /databaseType = "PostgreSQL"/);
+  assert.match(source, /!\["github\.com", "www\.github\.com"\]\.includes/);
   assert.match(source, /todo_items,/);
 });
