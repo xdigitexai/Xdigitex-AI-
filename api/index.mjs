@@ -4,6 +4,7 @@ import __bannerUrl from 'node:url';
 import { semanticTaskKey, normalizeProjectRoot } from './agent-task-identity.mjs';
 import { OrchestratorCore, applyTodoOperations, renderTodoMarkdown } from './orchestrator/index.mjs';
 import { loadRegistrySelection } from './agent-engine/v1/registry.mjs';
+import { canonicalRunResult, conciseRunTitle, deriveAcceptanceCriteria, detectRunType, professionalFinalReport, requestSpecificTodo } from './run-results-runtime.mjs';
 
 globalThis.require = __bannerCrReq(import.meta.url);
 globalThis.__filename = __bannerUrl.fileURLToPath(import.meta.url);
@@ -112401,6 +112402,8 @@ async function rememberAgentFact({ userId, scopeType, scopeId, key, value, sourc
   await pool.query(`INSERT INTO agent_scoped_memory(user_id,scope_type,scope_id,key,value,source,confidence,last_verified_at) VALUES($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT(user_id,scope_type,scope_id,key) DO UPDATE SET value=EXCLUDED.value,source=EXCLUDED.source,confidence=EXCLUDED.confidence,last_verified_at=NOW(),updated_at=NOW()`, [userId, scopeType, String(scopeId), key, serialized, source, confidence]);
 }
 function buildOrchestratorTodo(prompt, selection, targetContext) {
+  const specific = requestSpecificTodo(prompt, targetContext);
+  if (specific.length) return specific;
   const deploy = /\bdeploy|deployment|publish|production|nginx|domain|ssl\b/i.test(String(prompt));
   const titles = deploy
     ? ["Inspect target and deployment state", "Inspect repository and runtime", "Implement or configure the requested application", "Build and start only the target application", "Configure the requested domain and TLS", "Verify origin, public application, assets, and required APIs"]
@@ -112442,6 +112445,10 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
   const serverPublicIp = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(server.host || "")) ? server.host : null;
   const targetContext = { targetType, targetId: server.id, serverId: server.id, host: server.host, port: server.port, sshPort: server.port, username: server.username, serverPublicIp, projectName: repository?.split("/").pop() ?? null, repository, domain };
   task.targetContext = targetContext;
+  task.runType = detectRunType(promptText);
+  task.acceptance = deriveAcceptanceCriteria(promptText);
+  task.acceptanceCritical = task.acceptance.length > 1;
+  task.runTitle = conciseRunTitle(promptText, targetContext.projectName || server.name);
   const orchestrator = new OrchestratorCore();
   const initialized = orchestrator.initialize({ runId: task.runId, conversationId: task.conversationId, userId: String(task.userId), originalRequest: promptText, target: { type: targetType, targetId: server.id, serverId: server.id, host: server.host, sshPort: server.port, username: server.username }, project: { name: targetContext.projectName, repository }, deployment: { domain } });
   const todo = buildOrchestratorTodo(promptText, null, targetContext);
@@ -112473,10 +112480,10 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
       await client.query("UPDATE conversation_messages SET metadata=metadata||$2::jsonb WHERE id=$1", [message.rows[0].id, JSON.stringify({ attachmentIds: attached.rows.map(row => row.public_id) })]);
     }
     const taskItems = context.todo;
-    const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify(taskItems.map(({ title, owner }) => ({ title, owner, required: true }))), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true, orchestratorVersion: selection.version })]);
+    const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify(task.acceptance), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true, orchestratorVersion: selection.version, runType: task.runType })]);
     task.durableTaskDbId = plan.rows[0].id;
     for (const [position, item] of taskItems.entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence) VALUES($1,$2,$3,$4,$5)", [task.durableTaskDbId, position + 1, item.title, item.status, JSON.stringify({ taskKey: item.key, owner: item.owner })]);
-    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ orchestration: { version: selection.version, activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version }) => ({ id, version })), todo: taskItems } })]);
+    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ title: task.runTitle, runType: task.runType, acceptance: task.acceptance, workResults: [], changes: { files: [] }, orchestration: { version: selection.version, activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version }) => ({ id, version })), todo: taskItems } })]);
     await client.query("COMMIT");
     chatTaskEmit(task, "specialists_loaded", { activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })) });
     chatTaskEmit(task, "skills_loaded", { skills: selection.skills.map(({ id, version }) => ({ id, version })) });
@@ -112488,21 +112495,29 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
 }
 async function bridgeServerAgentRunFinish(task) {
   if (!task.durableRunDbId) return;
+  const taskRows = task.durableTaskDbId ? await pool.query("SELECT position,title,status,evidence FROM agent_task_items WHERE task_id=$1 ORDER BY position", [task.durableTaskDbId]) : { rows: [] };
+  const acceptance = task.acceptance || [];
+  const canonical = task.canonicalResult || canonicalRunResult({ requestedStatus: task.status, acceptance, todo: task.acceptanceCritical ? [] : taskRows.rows, filesChanged: task.filesModified || [], unresolved: task.orchestration?.context?.unresolved || [], summary: task.lastReply || "" });
+  task.canonicalResult = { ...canonical, title: task.runTitle, acceptance, completedTasks: taskRows.rows.filter(row => row.status === "completed").length, totalTasks: taskRows.rows.length };
+  if (task.status === "running" || task.status === "completed") task.status = canonical.complete ? "completed" : "partially_completed";
   const failed = task.status === "failed" || task.status === "error";
   const cancelled = task.status === "cancelled";
   const blocked = task.status === "blocked";
   const partial = task.status === "partially_completed";
   const status = cancelled ? "cancelled" : blocked ? "blocked" : partial ? "partially_completed" : failed ? "failed" : "completed";
-  const finalText = task.lastReply || (cancelled ? "Cancelled. Completed work was preserved and the conversation remains available." : blocked ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : partial ? "Partially completed. Review the completed work and outstanding verification in Task History." : failed ? "Failed. The task stopped after bounded recovery attempts. Review Task History for the final error." : "Completed. Review Task History for actions and verification evidence.");
+  let finalText = task.lastReply || (cancelled ? "Cancelled. Completed work was preserved and the conversation remains available." : blocked ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : partial ? "Partially completed. Review the completed work and outstanding verification in Task History." : failed ? "Failed. The task stopped after bounded recovery attempts. Review Task History for the final error." : "Completed. Review Task History for actions and verification evidence.");
+  if (canonical.status === "PARTIALLY_VERIFIED" && /\b(?:status\s*:\s*)?verified\b/i.test(finalText)) finalText = professionalFinalReport({ result: canonical, title: task.runTitle, summary: "The run stopped without sufficient evidence for every required acceptance check.", filesChanged: task.filesModified || [], durationMs: Date.now() - task.startedAt.getTime(), usage: { totalTokens: (task.inputTokens || 0) + (task.outputTokens || 0), creditsUsed: task.creditsUsed || 0, costUsd: task.costUsd || 0 } });
   const client = await pool.connect();
   try { await client.query("BEGIN");
     await client.query("UPDATE coding_agent_runs SET status=$2,phase=$2,heartbeat_at=NOW(),completed_at=NOW(),lock_token=NULL,updated_at=NOW(),error=CASE WHEN $2='failed' THEN $3 ELSE error END WHERE id=$1", [task.durableRunDbId, status, failed ? finalText : null]);
     await client.query("UPDATE agent_tasks SET status=$2,updated_at=NOW() WHERE id=$1", [task.durableTaskDbId, status]);
-    await client.query("UPDATE agent_task_items SET status=CASE WHEN $2='completed' THEN 'completed' WHEN status='in_progress' THEN 'failed' ELSE status END,evidence=CASE WHEN $2='completed' THEN $3 ELSE evidence END,updated_at=NOW() WHERE task_id=$1", [task.durableTaskDbId, status, JSON.stringify({ finalResponseStored: true, filesModified: task.filesModified ?? [] })]);
+    await client.query("UPDATE agent_task_items SET status=CASE WHEN $2='completed' AND $4=false THEN 'completed' WHEN status='in_progress' AND $2<>'completed' THEN 'not_tested' ELSE status END,evidence=CASE WHEN $2='completed' AND $4=false THEN $3 ELSE evidence END,updated_at=NOW() WHERE task_id=$1", [task.durableTaskDbId, status, JSON.stringify({ finalResponseStored: true, filesModified: task.filesModified ?? [] }), Boolean(task.acceptanceCritical)]);
     await client.query("SELECT pg_advisory_xact_lock($1)", [task.durableConversationDbId]);
     const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1", [task.durableConversationDbId])).rows[0].n;
-    const final = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,run_id,role,content,sequence,metadata) VALUES($1,$2,$3,'assistant',$4,$5,$6) RETURNING id`, [randomUUID2(), task.durableConversationDbId, task.durableRunDbId, finalText, sequence, JSON.stringify({ final: true, status, filesModified: task.filesModified ?? [] })]);
-    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ finalMessageId: final.rows[0].id, actionCount: task.timeline?.length ?? 0, filesModified: task.filesModified ?? [], usage: { inputTokens: task.inputTokens ?? 0, cachedInputTokens: task.cachedTokens ?? 0, outputTokens: task.outputTokens ?? 0, reasoningTokens: task.reasoningTokens ?? 0, totalTokens: (task.inputTokens ?? 0) + (task.outputTokens ?? 0), costUsd: task.costUsd ?? 0, creditsUsed: task.creditsUsed ?? 0, creditsRemaining: task.creditsRemaining ?? null } })]);
+    const resultMetadata = { ...task.canonicalResult, status: canonical.status, acceptance };
+    const workResults = taskRows.rows.filter(row => row.status === "completed").map(row => ({ title: row.title, owner: row.evidence?.owner || "orchestrator", status: row.status, evidence: row.evidence || {} }));
+    const final = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,run_id,role,content,sequence,metadata) VALUES($1,$2,$3,'assistant',$4,$5,$6) RETURNING id`, [randomUUID2(), task.durableConversationDbId, task.durableRunDbId, finalText, sequence, JSON.stringify({ final: true, status, canonicalStatus: canonical.status, result: resultMetadata, filesModified: task.filesModified ?? [] })]);
+    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ finalMessageId: final.rows[0].id, actionCount: task.timeline?.length ?? 0, filesModified: task.filesModified ?? [], result: resultMetadata, acceptance, workResults, changes: { files: task.filesModified ?? [] }, usage: { inputTokens: task.inputTokens ?? 0, cachedInputTokens: task.cachedTokens ?? 0, outputTokens: task.outputTokens ?? 0, reasoningTokens: task.reasoningTokens ?? 0, totalTokens: (task.inputTokens ?? 0) + (task.outputTokens ?? 0), costUsd: task.costUsd ?? 0, creditsUsed: task.creditsUsed ?? 0, creditsRemaining: task.creditsRemaining ?? null } })]);
     await client.query("UPDATE conversations SET last_message_at=NOW(),updated_at=NOW() WHERE id=$1", [task.durableConversationDbId]);
     if (task.queueInstructionId) await client.query("UPDATE agent_instruction_queue SET status=$2,completed_at=NOW(),updated_at=NOW() WHERE public_id=$1 AND user_id=$3", [task.queueInstructionId, status === "completed" ? "completed" : "failed", task.userId]);
     await client.query("COMMIT");
@@ -112516,8 +112531,21 @@ async function completeRunTask(task, evidence) {
     const current = await client.query("SELECT id,position,title FROM agent_task_items WHERE task_id=$1 AND status='in_progress' ORDER BY position LIMIT 1 FOR UPDATE", [task.durableTaskDbId]);
     if (!current.rowCount) { await client.query("COMMIT"); return; }
     const item = current.rows[0];
+    const requiresBehavioralProof = /\b(test|verify|audio|video|incoming call|call history|turn relay|mobile call|production call quality)\b/i.test(item.title);
+    if (task.acceptanceCritical && (evidence?.connection || requiresBehavioralProof && evidence?.verificationResult !== "passed")) {
+      await client.query("COMMIT");
+      if (requiresBehavioralProof) chatTaskEmit(task, "verification_result", { key: semanticTaskKey(item.title, task.targetContext), status: "not_tested", method: "missing_behavioral_evidence", evidence: [] });
+      return;
+    }
     await client.query("UPDATE agent_task_items SET status='completed',evidence=$2,updated_at=NOW() WHERE id=$1", [item.id, JSON.stringify(evidence ?? {})]);
+    const memoryTodo = task.orchestration?.context?.todo;
+    if (memoryTodo?.[item.position - 1]) memoryTodo[item.position - 1] = { ...memoryTodo[item.position - 1], status: "completed", evidence: evidence ?? {} };
+    if (task.acceptance?.[item.position - 1]) {
+      task.acceptance[item.position - 1] = { ...task.acceptance[item.position - 1], status: "passed", evidence: [JSON.stringify(evidence ?? {})] };
+      await client.query("UPDATE coding_agent_runs SET metadata=jsonb_set(metadata,'{acceptance}',$2::jsonb,true),updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify(task.acceptance)]);
+    }
     const next = await client.query("UPDATE agent_task_items SET status='in_progress',updated_at=NOW() WHERE id=(SELECT id FROM agent_task_items WHERE task_id=$1 AND status='pending' ORDER BY position LIMIT 1) RETURNING title,position", [task.durableTaskDbId]);
+    if (next.rowCount && memoryTodo?.[next.rows[0].position - 1]) memoryTodo[next.rows[0].position - 1] = { ...memoryTodo[next.rows[0].position - 1], status: "in_progress" };
     await client.query("UPDATE agent_runs SET heartbeat_at=NOW(),current_step=$2 WHERE run_id=$1", [task.runId, next.rows[0]?.title ?? "Finalizing response"]);
     await client.query("COMMIT");
     chatTaskEmit(task, "task_complete", { task: item.title, position: item.position });
@@ -112525,22 +112553,11 @@ async function completeRunTask(task, evidence) {
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 }
 function formatTerminalRunReport({ message, request, task, durationMs, completedTasks, totalTasks }) {
-  const existing = String(message || "Task completed.").replace(/^\s*STATUS\s*:[^\n]*\n?/im, "").trim();
-  const verified = /status\s*:\s*verified|\bverified\b/i.test(String(message || ""));
-  const ctx = task.targetContext || {};
-  const totalTokens = (task.inputTokens ?? 0) + (task.outputTokens ?? 0);
-  const mins = String(Math.floor(durationMs / 6e4)).padStart(2, "0"), secs = String(Math.floor(durationMs % 6e4 / 1e3)).padStart(2, "0");
-  const lines = [
-    `STATUS: ${verified ? "VERIFIED" : "COMPLETED"}`, "", `REQUEST:\n${String(request || "").slice(0, 1500)}`, "",
-    `TARGET:\n${String(ctx.targetType || "server").toUpperCase()} · ${ctx.serverPublicIp || ctx.host || "Unknown"} · SSH ${ctx.sshPort || ctx.port || "Unknown"}`,
-    ctx.projectName ? `\nPROJECT:\n${ctx.projectName}${ctx.projectRoot ? ` · ${ctx.projectRoot}` : ""}` : "",
-    ctx.domain ? `\nDOMAIN:\nhttps://${ctx.domain}` : "", "",
-    `TASKS:\n${completedTasks} / ${totalTasks} completed`, "", `TIME WORKED:\n${mins}m ${secs}s`, "",
-    `USAGE:\nInput tokens: ${task.inputTokens ?? 0}\nCached input tokens: ${task.cachedTokens ?? 0}\nOutput tokens: ${task.outputTokens ?? 0}\nTotal tokens: ${totalTokens}\nCost: $${Number(task.costUsd ?? 0).toFixed(6)}\nCredits used: ${task.creditsUsed ?? 0}\nCredits remaining: ${task.creditsRemaining ?? "Unavailable"}`,
-    "", `WHAT WAS DONE:\n${existing}`
-  ];
-  if (verified && ctx.domain) lines.push("", `LIVE:\nhttps://${ctx.domain}`);
-  return lines.filter((line) => line !== "").join("\n");
+  const todo = task.acceptanceCritical ? [] : task.orchestration?.context?.todo || [];
+  const result = canonicalRunResult({ requestedStatus: task.status, acceptance: task.acceptance || [], todo, filesChanged: task.filesModified || [], unresolved: task.orchestration?.context?.unresolved || [], summary: message });
+  task.canonicalResult = { ...result, title: task.runTitle, acceptance: task.acceptance || [], completedTasks, totalTasks };
+  if (result.status === "PARTIALLY_VERIFIED") task.status = "partially_completed";
+  return professionalFinalReport({ result, title: task.runTitle || conciseRunTitle(request, task.targetContext?.projectName), summary: message, filesChanged: task.filesModified || [], durationMs, usage: { totalTokens: (task.inputTokens || 0) + (task.outputTokens || 0), creditsUsed: task.creditsUsed || 0, costUsd: task.costUsd || 0 } });
 }
 async function addRunTasks(task, titles, reason) {
   if (!task?.durableTaskDbId || !Array.isArray(titles)) return [];
@@ -112570,10 +112587,12 @@ async function reconcileRunDiscoveries(task, output) {
   const discovered = {};
   const projectName = String(task?.targetContext?.projectName || "");
   const projectRoot = normalizeProjectRoot(text, projectName);
+  const inspectedFile = text.match(/\/(?:var\/www|home|opt)\/[\w./-]+\.(?:prisma|tsx?|jsx?|mjs|cjs|py|php|json|ya?ml|toml|conf|sql)\b/i)?.[0] ?? null;
   const listen = text.match(/\b(127\.0\.0\.1|0\.0\.0\.0|localhost|\[::\]|::):(\d{2,5})\b/i);
   const appPort = listen?.[2] ?? text.match(/\b(?:PORT|port)\s*[=:]\s*(\d{2,5})\b/i)?.[1];
   const processName = text.match(/(?:pm2[^\n]*|name[^\n]*?)\b([a-z0-9][a-z0-9_-]*(?:airtel|starlink)[a-z0-9_-]*)\b/i)?.[1];
-  if (projectRoot) discovered.projectRoot = projectRoot;
+  if (projectRoot && !task?.targetContext?.projectRoot) discovered.projectRoot = projectRoot;
+  if (inspectedFile) { discovered.currentFile = inspectedFile; if (/schema\.prisma$/i.test(inspectedFile)) discovered.schemaFile = inspectedFile; }
   if (appPort) discovered.appPort = Number(appPort);
   if (listen) discovered.appBind = listen[1].toLowerCase() === "localhost" ? "127.0.0.1" : listen[1];
   if (processName) discovered.processName = processName;
@@ -117515,7 +117534,7 @@ Now CONTINUE the task. Do NOT ask the user \u2014 search, read, and fix autonomo
             consecutiveVerifyOnlyIters++;
             if (consecutiveVerifyOnlyIters >= 4 && !hasAddedVerifyLoopWarning && iter > 4) {
               hasAddedVerifyLoopWarning = true;
-              send2("think", { text: `\u26A0\uFE0F Verify-loop detected \u2014 ${consecutiveVerifyOnlyIters} consecutive read-only iterations, no file changes. Forcing wrap-up.` });
+              send2("think", { text: `Inspection workstream compacted after ${consecutiveVerifyOnlyIters} read-only iterations. Comparing remaining acceptance criteria and routing real verification.` });
               aiMessages.push({ role: "assistant", content: raw });
               aiMessages.push({
                 role: "user",
@@ -117523,18 +117542,15 @@ Now CONTINUE the task. Do NOT ask the user \u2014 search, read, and fix autonomo
                   `\u26A0\uFE0F VERIFICATION LOOP DETECTED \u2014 you have run ${consecutiveVerifyOnlyIters} consecutive iterations with ONLY read/check commands (ls, cat, curl, grep, find, ps, ss, head, tail).`,
                   ``,
                   `You have NOT modified any files or restarted any services in the last ${consecutiveVerifyOnlyIters} iterations.`,
-                  `This means the task is already done and you are re-verifying a completed result.`,
+                  `Inspection alone does not complete implementation or behavioral acceptance criteria.`,
                   ``,
-                  `REQUIRED ACTION: emit action="done" RIGHT NOW with STATUS: VERIFIED.`,
-                  `Your done message must include:`,
-                  `  \u2022 What is running (service name, port, URL)`,
-                  `  \u2022 What was built or fixed`,
-                  `  \u2022 Any confirmed HTTP status codes`,
+                  `REQUIRED ACTION: summarize discovered facts, compare them with the acceptance matrix, then hand off to the specialist capable of the missing implementation or real verification.`,
+                  `If required proof cannot be performed, finish honestly as PARTIALLY VERIFIED with those items NOT TESTED.`,
                   ``,
                   `\u26D4 DO NOT run any more curl / ls / grep / find commands.`,
                   `\u26D4 DO NOT browse again.`,
                   `\u26D4 DO NOT plan more steps.`,
-                  `The verification evidence is already in your context above. Use it. Wrap up NOW.`
+                  `Do not infer audio, video, authentication, TURN, database behavior or UI success from source inspection or HTTP reachability.`
                 ].join("\n")
               });
               continue;
@@ -118659,7 +118675,11 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
       notifyTaskComplete(task, "", true).catch(() => {
       });
     } finally {
-      if (task.status === "running") task.status = "completed";
+      if (task.status === "running") {
+        const result = canonicalRunResult({ requestedStatus: task.status, acceptance: task.acceptance || [], todo: task.acceptanceCritical ? [] : task.orchestration?.context?.todo || [], filesChanged: task.filesModified || [], unresolved: task.orchestration?.context?.unresolved || [], summary: task.lastReply || "" });
+        task.canonicalResult ||= { ...result, title: task.runTitle, acceptance: task.acceptance || [] };
+        task.status = result.complete ? "completed" : "partially_completed";
+      }
       if (!task.lastReply) chatTaskEmit(task, "reply", { text: task.status === "completed" ? "Completed. The requested work finished; see Task History for the recorded actions and verification." : task.status === "cancelled" ? "Cancelled. Completed work was preserved." : task.status === "blocked" ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : "Failed. The task stopped after bounded recovery attempts." });
       // Emit lifecycle event + persist to DB
       try {
@@ -119345,7 +119365,7 @@ router8.get("/:id/conversations", requireAuth, async (req, res) => {
     (SELECT content FROM conversation_messages m WHERE m.conversation_id=c.id ORDER BY sequence DESC LIMIT 1) preview,
     (SELECT COUNT(*)::int FROM conversation_messages m WHERE m.conversation_id=c.id) message_count,
     (SELECT COUNT(*)::int FROM coding_agent_runs r WHERE r.conversation_id=c.id) run_count,
-    (SELECT status FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_run_status,
+    (SELECT COALESCE(r.metadata->'result'->>'status',r.status) FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_run_status,
     (SELECT GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(r.completed_at,NOW())-r.started_at))*1000)::bigint FROM coding_agent_runs r WHERE r.conversation_id=c.id ORDER BY id DESC LIMIT 1) latest_duration_ms,
     (SELECT COALESCE(SUM(u.charged_credits),0) FROM coding_agent_runs r LEFT JOIN agent_usage_ledger u ON u.run_id=r.id AND u.status='settled' WHERE r.conversation_id=c.id GROUP BY r.id ORDER BY r.id DESC LIMIT 1) latest_credits_used
     FROM conversations c WHERE c.server_id=$1 AND c.user_id=$2${searchSql} ORDER BY c.last_message_at DESC LIMIT $${values.length-1} OFFSET $${values.length}`, values);

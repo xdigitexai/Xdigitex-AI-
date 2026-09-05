@@ -16,6 +16,7 @@ const definitions = {
   infrastructure: { file: "infrastructure.md", skills: [] },
   testing: { file: "testing.md", skills: [] },
   debugging: { file: "debugging.md", skills: ["debugging"] },
+  realtime: { file: "realtime.md", skills: ["webrtc", "socketio", "turn", "prisma"] },
   vps: { file: "adapters/vps.md", skills: ["vps", "ssh"] },
   cpanel: { file: "adapters/cpanel.md", skills: ["cpanel"] },
   local: { file: "adapters/local.md", skills: [] },
@@ -29,7 +30,7 @@ const skillFiles = {
   vps: "../../skills/devops/vps.md", ssh: "../../skills/devops/ssh.md",
   cpanel: "../../skills/devops/cpanel.md", website: "../../skills/verification/website.md",
   api: "../../skills/verification/api.md", pnpm: "skills/pnpm.md", npm: "skills/npm.md",
-  pm2: "skills/pm2.md", systemd: "skills/systemd.md", express: "skills/express.md",
+  pm2: "skills/pm2.md", systemd: "skills/systemd.md", express: "skills/express.md", webrtc: "skills/webrtc.md", socketio: "skills/socketio.md", turn: "skills/turn.md", prisma: "skills/prisma.md",
 };
 
 const textOf = (input) => [input.request, input.context?.currentTask, ...(input.todo || []).map(t => `${t.key || ""} ${t.title || ""}`), ...(input.context?.findings || [])].join(" ").toLowerCase();
@@ -47,6 +48,7 @@ export function selectSpecialists(input = {}) {
   const backend = has(text, /\b(backend|api|endpoint|express|server route|healthz?|cron|worker|queue)\b/);
   const debug = has(text, /\b(fix|bug|error|fail|broken|debug|not working|stuck|missing|404|500|502)\b/);
   const coding = has(text, /\b(build|implement|create|code|refactor|feature|function|class|file)\b/) || (debug && !deploy);
+  const realtime = has(text, /\b(webrtc|audio call|video call|calling|signaling|socket\.io|stun|turn|ice candidate|media track|rtcstats)\b/);
 
   if (deploy) add(agents, "deployment", "testing");
   if (git) add(agents, "github");
@@ -55,6 +57,7 @@ export function selectSpecialists(input = {}) {
   if (backend) add(agents, "backend");
   if (debug) add(agents, "debugging");
   if (coding) add(agents, "coding");
+  if (realtime) add(agents, "realtime", "frontend", "backend", "testing");
   if (deploy && has(text, /\b(nginx|apache|ssl|tls|certbot|proxy|pm2|systemd|docker|domain|vhost)\b/)) add(agents, "infrastructure");
   if (target === "cpanel" || has(text, /\bcpanel\b/)) add(agents, "cpanel");
   else if (target === "local" || has(text, /\b(localhost|desktop bridge|local machine)\b/)) add(agents, "local");
@@ -77,6 +80,10 @@ export function selectSkills(input = {}, agents = selectSpecialists(input)) {
   if (/\bdocker|compose\b/.test(evidence)) skills.add("docker");
   if (/\bnginx\b/.test(evidence)) skills.add("nginx");
   if (/\bpm2\b/.test(evidence)) skills.add("pm2");
+  if (/\bwebrtc|rtcpeerconnection|mediastream|getusermedia|rtcstats\b/.test(evidence)) skills.add("webrtc");
+  if (/\bsocket\.io|signaling|offer|answer|ice candidate\b/.test(evidence)) skills.add("socketio");
+  if (/\bstun|turn|coturn|relay candidate\b/.test(evidence)) skills.add("turn");
+  if (/\bprisma|schema\.prisma\b/.test(evidence)) skills.add("prisma");
   if (/\bsystemd|systemctl\b/.test(evidence)) skills.add("systemd");
   if (agents.includes("frontend") && agents.includes("testing")) skills.add("website");
   if (agents.includes("backend") && agents.includes("testing")) skills.add("api");

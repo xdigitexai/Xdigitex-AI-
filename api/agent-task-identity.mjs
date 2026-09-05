@@ -16,5 +16,14 @@ export function semanticTaskKey(title, context = {}) {
 
 export function normalizeProjectRoot(output, projectName = "") {
   const candidates = [...String(output || "").matchAll(/(?:^|[\s=:"'])(\/(?:var\/www|home|opt)\/[\w./-]+)/gm)].map((match) => match[1].replace(/[,:;]+$/, ""));
-  return candidates.map((candidate) => projectName && candidate.includes(`/${projectName}/`) ? candidate.slice(0, candidate.indexOf(`/${projectName}/`) + projectName.length + 1) : candidate).find((candidate) => !/(?:^|\/)(?:node_modules|dist|build|\.next)(?:\/|$)|\.(?:c?js|mjs|ts|py|php)$/i.test(candidate)) ?? null;
+  return candidates.map((candidate) => {
+    if (projectName) { const marker = `/${projectName}`, at = candidate.toLowerCase().indexOf(marker.toLowerCase()), end = at + marker.length; if (at >= 0 && (candidate.length === end || candidate[end] === "/")) return candidate.slice(0, end); }
+    if (projectName) return null;
+    if (/(?:^|\/)(?:node_modules|dist|build|\.next)(?:\/|$)/i.test(candidate)) return null;
+    const parts = candidate.split("/");
+    if (candidate.startsWith("/var/www/") && parts.length >= 4) return parts.slice(0, 4).join("/");
+    if (candidate.startsWith("/opt/") && parts.length >= 3) return parts.slice(0, 3).join("/");
+    const fileAt = parts.findIndex((part, index) => index > 2 && (/\.[a-z0-9]{1,12}$/i.test(part) || ["Dockerfile", "Makefile", "Procfile"].includes(part)));
+    return fileAt > 0 ? parts.slice(0, fileAt).join("/") : candidate;
+  }).find((candidate) => candidate && !/(?:^|\/)(?:node_modules|dist|build|\.next)(?:\/|$)/i.test(candidate)) ?? null;
 }
