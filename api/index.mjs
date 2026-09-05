@@ -112258,6 +112258,7 @@ function trackFileWrites(cmd, task) {
 var chatTaskStore = /* @__PURE__ */ new Map();
 function conciseConversationTitle(value) {
   const clean = String(value || "New chat").replace(/[`*_#>\[\]()]/g, " ").replace(/\s+/g, " ").trim();
+  if (/\b(?:plan[eè]te\s+libia|libia-ai|audio.{0,20}video.{0,20}call|calling system)\b/i.test(clean)) return "PLANÈTE LIBIA AI calls";
   const domain = clean.match(/(?:on\s+)?([a-z0-9-]+)\.(?:com|site|online|net|org|io|co)\b/i)?.[1];
   const name = domain ? domain.charAt(0).toUpperCase() + domain.slice(1) : "";
   if (domain && /invite|referral|refer/i.test(clean)) return `${name} referral promo`;

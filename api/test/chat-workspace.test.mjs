@@ -1,65 +1,63 @@
-import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import test from "node:test";
+import assert from "node:assert/strict"
+import { readFile } from "node:fs/promises"
+import test from "node:test"
 
-const workspace = await readFile(new URL("../../frontend/public/chat-workspace.js", import.meta.url), "utf8");
-const html = await readFile(new URL("../../frontend/public/index.html", import.meta.url), "utf8");
+const workspace = await readFile(new URL("../../frontend/public/chat-workspace-codex.js", import.meta.url), "utf8")
+const html = await readFile(new URL("../../frontend/public/index.html", import.meta.url), "utf8")
+const runCardSource = workspace.slice(workspace.indexOf("function runCard"), workspace.indexOf("function queuedMessages"))
 
-test("canonical chat URL boots the persistent workspace", () => {
-  assert.match(workspace, /\/servers\\\/\(\\d\+\)\\\/chats/);
-  assert.match(workspace, /conversations\/\$\{cid\}/);
-  assert.match(html, /chat-workspace\.js/);
-});
+test("canonical persistent chat URL boots the Codex-style workspace", () => {
+  assert.match(workspace, /\/servers\\\/\(\\d\+\)\\\/chats/)
+  assert.match(workspace, /conversations\/\$\{conversationId\}/)
+  assert.match(html, /chat-workspace-codex\.js/)
+})
 
-test("workspace supports history, new chat, follow-up, and inline persisted activity", () => {
-  assert.match(workspace, /Chat history/);
-  assert.match(workspace, /\+ New Chat/);
-  assert.match(workspace, /messages:\[\{role:"user",content:text\}\]/);
-  assert.match(workspace, /runs\/\$\{r\.run_id\}\/events/);
-  assert.match(workspace, /Command output/);
-  assert.doesNotMatch(workspace, /View activity/);
-  assert.match(workspace, /trigger_message_id/);
-  assert.match(workspace, /PATH\\s\+\[ABC\]/);
-  assert.doesNotMatch(workspace, /completed · completed/);
-});
+test("workspace is conversation-first with three distinct panes", () => {
+  for (const marker of ["sidebar", "messages", "context-panel", "composer", "context-tabs"]) assert.match(workspace, new RegExp(marker))
+  for (const tab of ["overview", "tasks", "files", "changes", "queue", "activity"]) assert.match(workspace, new RegExp(`"${tab}"`))
+  assert.match(workspace, /context-hidden/)
+  assert.doesNotMatch(workspace, /Show technical details/)
+})
 
-test("server cards route reliably and execution logs scroll independently", () => {
-  assert.match(workspace, /body\.items\|\|body\.servers\|\|body\.data/);
-  assert.match(workspace, /\/servers\/\$\{server\.id\}\/conversations/);
-  assert.match(workspace, /max-height:min\(300px,38vh\)/);
-  assert.match(workspace, /max-height:35vh/);
-  assert.match(workspace, /New activity ↓/);
-  assert.match(workspace, /CSS\.escape\(runId\)/);
-  assert.match(workspace, /replace\(\/\\uFFFD\/g/);
-  assert.match(workspace, /Conversation creation failed/);
-  assert.match(workspace, /conversation\.canonicalUrl/);
-});
+test("main run card stays compact and structured state drives status", () => {
+  assert.match(workspace, /function runCard\(run\)/)
+  assert.match(workspace, /result\.status\|\|run\.status/)
+  assert.match(workspace, /checks verified/)
+  assert.match(workspace, /data-stop/)
+  assert.doesNotMatch(runCardSource, /REQUEST:/)
+  assert.doesNotMatch(workspace, /function eventView/)
+})
 
-test("execution details and long prompts are compact by default", () => {
-  assert.match(workspace, /Show technical details/);
-  assert.match(workspace, /Command output/);
-  assert.match(workspace, /Show full/);
-  assert.match(workspace, /content\.length>2000/);
-  assert.match(workspace, /Open as \.txt/);
-  assert.match(workspace, /data-copy/);
-  assert.match(workspace, /navigator\.clipboard\.writeText/);
-  assert.match(workspace, /showModal/);
-  assert.doesNotMatch(workspace, /class="prompt-more"/);
-  assert.match(workspace, /task\.created/);
-  assert.match(workspace, /cmd_results\|credits_used\|tokens/);
-});
+test("long prompts, attachments, and queued messages remain conversational", () => {
+  assert.match(workspace, /lines\.slice\(0,12\)/)
+  assert.match(workspace, /Show full/)
+  assert.match(workspace, /Open as text/)
+  assert.match(workspace, /function queuedMessages/)
+  assert.match(workspace, /Queue":"Send/)
+  assert.match(workspace, /data-qedit/)
+})
 
-test("run card renders authoritative TODO and target context", () => {
-  assert.match(workspace, /function todoView\(r\)/);
-  assert.match(workspace, /r\.todo_items/);
-  assert.match(workspace, /HOSTING \/ CPANEL/);
-  assert.match(workspace, /Project:/);
-  assert.match(workspace, /Public IP:/);
-  assert.match(workspace, /Origin:/);
-  assert.match(workspace, /Database:/);
-  assert.match(workspace, /event\.type==="todo\.created"/);
-  assert.match(workspace, /event\.type==="target\.updated"/);
-  assert.match(workspace, /Tokens:/);
-  assert.match(workspace, /Cost:/);
-  assert.match(workspace, /credits_remaining/);
-});
+test("attachment records and pending selections are deduplicated", () => {
+  assert.match(workspace, /function dedupeAttachments/)
+  assert.match(workspace, /seen\.has\(key\)/)
+  assert.match(workspace, /lastModified===file\.lastModified/)
+  assert.match(workspace, /attachment-chip/)
+  assert.match(workspace, /previewAttachment/)
+  assert.match(workspace, /ondragover/)
+  assert.match(workspace, /clipboardData\.items/)
+})
+
+test("activity is grouped, bounded, and isolated from main run cards", () => {
+  assert.match(workspace, /function groupedActivity/)
+  assert.match(workspace, /slice\(-80\)/)
+  assert.match(workspace, /activity-group/)
+  assert.doesNotMatch(runCardSource, /activity-group|cmd_output|Command output/)
+})
+
+test("desktop and mobile layouts keep composer and panels usable", () => {
+  assert.match(workspace, /grid-template-columns:240px minmax\(460px,1fr\) 330px/)
+  assert.match(workspace, /@media\(max-width:720px\)/)
+  assert.match(workspace, /position:fixed;inset:0 18% 0 0/)
+  assert.match(workspace, /pending-chip\{max-width:100%/)
+  assert.match(workspace, /!event\.shiftKey/)
+})
