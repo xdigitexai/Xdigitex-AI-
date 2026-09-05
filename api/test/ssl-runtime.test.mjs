@@ -58,7 +58,7 @@ test("runtime applies SSL evidence rather than sequential command completion", a
   assert.match(source, /if \(task\.isSslTask\) await applySslRunEvidence/)
   assert.match(source, /\[SSL COMPLETION GATE\]/)
   assert.match(source, /lastSslIssueMutationEpoch === mutationEpoch/)
-  assert.match(source, /task\.isSslTask \? 14/)
+  assert.match(source, /task\.isSslTask \? 32/)
   assert.match(source, /task\.isSslTask \? 16/)
   assert.match(source, /simpleTaskFastPath \|\| task\.isSslTask \? Promise\.resolve/)
   assert.match(source, /task\.isSslTask \? \[\{ role: "user", content: userTaskText\.slice/)

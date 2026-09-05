@@ -9,6 +9,7 @@ import { compactSslResults, sslDomain, sslEvidenceFromResults, sslRecoveryFromRe
 import { createStartupTrace, validateExecutableTodo } from './run-startup-runtime.mjs';
 import { EXECUTION_TOOL, HOSTING_DETECTION_TOOL, normalizeModelTurn, partiallyVerifiedAllowed, validateRemoteToolCall } from './agent-tool-protocol.mjs';
 import { classifyTaskRuntimeFailure, reconcileRun, startOrResumeTask } from './run-task-state.mjs';
+import { ReasoningRecoveryState, buildCompactReasoningState, buildReplanCheckpoint } from './reasoning-recovery.mjs';
 
 globalThis.require = __bannerCrReq(import.meta.url);
 globalThis.__filename = __bannerUrl.fileURLToPath(import.meta.url);
@@ -116415,7 +116416,7 @@ void (async () => {
       }
       const xd_readOnlyTask = /\b(check|inspect|status|report|show|list|verify|diagnose)\b/i.test(userTaskText) && (/\b(?:do not|don't|without)\s+(?:make\s+)?(?:any\s+)?(?:changes?|modify|restart|reload|write|install|configure|deploy|delete|remove|update)\b/i.test(userTaskText) || !/\b(fix|change|modify|write|create|install|restart|reload|deploy|delete|remove|update|configure)\b/i.test(userTaskText));
       const xd_compactServerPrompt = `You are XDIGITEX Server Agent connected only to ${s2.username}@${s2.host}:${s2.port}. Complete the user's read-only request autonomously. Use run_remote_command for the minimum targeted commands and never modify files, configuration, services, SSH settings, authentication, or firewall rules. Do not repeat an unchanged command. A command completing is not the task completing; continue until all parts are checked. Return user-facing text only when finished.`;
-      const xd_compactSslPrompt = `You are the XDIGITEX Infrastructure/SSL specialist connected through the owned server record. Install and verify SSL only for ${task.sslDomain}. Use run_remote_command and a bounded sequence: compare DNS A/AAAA with the bound server; detect Nginx, Apache, LiteSpeed, OpenLiteSpeed or cPanel; identify the exact vhost/document root; inspect the existing SNI certificate; verify a temporary scoped ACME challenge; choose Certbot, webroot, AutoSSL or cPanel API from the detected environment; issue and bind the certificate; validate server configuration before a scoped reload; remove the challenge file; verify SAN, expiry, chain, normal HTTPS, correct site and renewal. A 404 is recoverable: diagnose and fix its route automatically. Never inspect application source or Git history, never touch another domain, never alter SSH/firewall, never expose private keys, never use -k/--insecure as final proof, and never ask whether to continue safe recovery. Never print command JSON. Do not return a final answer until every acceptance criterion has evidence; otherwise report only a verified external blocker or unrecoverable failure.`;
+      const xd_compactSslPrompt = `You are the XDIGITEX Infrastructure/SSL specialist connected through the owned server record. You are the primary reasoning and strategy engine; tools execute and report evidence but never choose the strategy. Install and verify SSL only for ${task.sslDomain}. First batch cheap discovery: compare DNS A/AAAA with the bound server; detect Nginx, Apache, LiteSpeed, OpenLiteSpeed or cPanel, privilege, document root and available certificate-management mechanisms; and inspect the existing SNI certificate subject, SAN, issuer, expiry and chain. From that evidence choose the appropriate path—an existing certificate binding repair, cPanel AutoSSL/account API, Certbot webroot/server plugin, LiteSpeed configuration, DNS challenge, or another evidenced method. This list is guidance, not a fixed workflow. Keep the TODO as your evolving plan and revise it whenever discoveries invalidate an earlier approach. A failed action is evidence: do not repeat an unchanged action more than twice, but do not end the run merely because one strategy failed. Diagnose it and choose a materially different reasonable authorized strategy. Use run_remote_command for execution. Validate server configuration before a scoped reload; remove temporary challenge artifacts; verify SAN, expiry, chain, normal HTTPS, correct site and renewal. A 404 is recoverable: diagnose and fix its route automatically. Never inspect unrelated application source or Git history, never touch another domain, never alter SSH/firewall, never expose private keys, never use -k/--insecure as final proof, and never ask whether to continue safe recovery. Never print command JSON. Do not return a final answer until every acceptance criterion has evidence; otherwise report only a verified external blocker after reasonable authorized strategies are exhausted.`;
       var xd_finalSysPrompt = task.isSslTask ? `${xd_skRes.block}\n\n${xd_compactSslPrompt}` : xd_readOnlyTask ? xd_compactServerPrompt : (xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt);
       task.startupStage = "task.start"; task.startupTrace?.mark(task.startupStage, { taskKey: task.orchestration?.context?.todo?.find(item => item.status === "in_progress")?.key || null });
       const firstTaskKey = task.orchestration?.context?.todo?.find(item => ["in_progress", "running"].includes(item.status))?.key || task.orchestration?.context?.todo?.find(item => item.status === "pending")?.key;
@@ -116427,6 +116428,7 @@ void (async () => {
         { role: "system", content: xd_finalSysPrompt },
         ...(task.isSslTask ? [{ role: "user", content: userTaskText.slice(0, 1200) }] : parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content })))
       ];
+      aiMessages.push({ role: "user", content: `[AGENT DECISION CONTRACT]\nInfer the intended goal from the request and relevant conversation context. You own diagnosis, strategy selection, prioritization, TODO changes, adaptation, and the completion recommendation. Tools and scripts only perform deterministic inspection or execution. Batch related cheap checks into one tool call, then reason over their structured evidence. A failed action is information: do not repeat an unchanged action indefinitely and do not terminate merely because one approach failed. Before ending after a recoverable failure, reconsider the original objective, failed strategies, remaining acceptance criteria, and available tools. Success still requires backend-verifiable evidence.` });
       aiMessages.push({ role: "user", content: `[REMOTE EXECUTION CONTRACT]\nYou are already connected through the owned server record (serverId ${s2.id}) and its saved ${s2.authType ?? "key"} credential. Call run_remote_command for execution. Never run ssh, sshpass, scp, sftp, or construct username@host authentication commands. The backend owns credentials and returns structured results.` });
       if (task.attachmentContext?.length) aiMessages.push({ role: "user", content: `[ATTACHMENT REFERENCES]\nUse only attachments relevant to the active specialist. Uploading a file does not authorize execution. ZIP manifests are lazy-inspected and archive contents must not be broadly injected into context.\n${task.attachmentContext.map(file => `- ${file.public_id}: ${file.name} (${file.mime_type}, ${file.size_bytes} bytes)${file.comment ? ` — ${file.comment}` : ""}; status=${file.processing_status}; routed=${(file.metadata?.specialists || []).join(",")}${file.manifest ? `; manifest=${JSON.stringify(file.manifest).slice(0, 3000)}` : ""}${file.preview ? `; preview=${String(file.preview).slice(0, 3000)}` : ""}`).join("\n")}` });
       if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText)) aiMessages.push({ role: "user", content: `[PROFESSIONAL DEPLOYMENT CONTRACT]\nWork manifest-first and stay bounded: inspect only existing deployment manifests, package/runtime manifests, README deployment instructions, environment examples, and the actual entry point before reading source. Detect Docker/Compose before reconstructing a manual deployment. Cache the discovered stack, package manager, project root, process manager, web server, application bind and port; do not rediscover unchanged facts. Treat every project as isolated and never stop another project to obtain a preferred port.\n\nExplicitly distinguish the connected execution target (VPS, cPanel/shared hosting, or local computer) from browser verification. On a VPS, detect whether the app listens on loopback or a public interface and perform the correct origin check from the VPS. On cPanel, discover the requested domain's real document root; never assume public_html. Origin health is never final website health. The final website check uses the actual HTTPS hostname (or curl --resolve with hostname/SNI while DNS propagates), without --insecure.\n\nBefore deployment, derive expected behavior from the repository: API-only, frontend, or full-stack, plus at least one recognizable title, brand, root element, or asset. For frontend/full-stack work, inspect the public response body and separately verify referenced JavaScript/CSS/assets; JSON health at / and PM2 online do not prove a frontend deployment. Verify the API separately when present. If the public root serves an API, default page, stale app, blank shell, or broken assets instead of the expected frontend, fix routing and continue. Use a real browser when available for final render verification.\n\nComplete safe prerequisites autonomously. If DATABASE_URL is missing, inspect the actual ORM/schema/migrations, provision an isolated database and application user when safe, configure secrets without printing them, migrate, restart only the target process, and verify fresh logs and database-backed behavior. Add newly discovered requirements to the durable TODO immediately. Finish only when the requested application is accessible at its requested destination, or report the exact external blocker and preserved state.` });
@@ -116592,7 +116594,7 @@ Tell the user to check that the agent script is still running in their terminal 
       let sslEfficiencyWarned = false;
       const originalUserMessage = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
       const taskComplexity = task.isSslTask || simpleTaskFastPath ? "simple" : /\b(rebuild|migrate|architecture|entire|full|multiple|complete system)\b/i.test(originalUserMessage) ? "complex" : /\b(deploy|install|implement|redesign|integrate)\b/i.test(originalUserMessage) ? "moderate" : "simple";
-      const maxIterations = task.isSslTask ? 14 : taskComplexity === "complex" ? 60 : taskComplexity === "moderate" ? 40 : 16;
+      let maxIterations = task.isSslTask ? 32 : taskComplexity === "complex" ? 60 : taskComplexity === "moderate" ? 40 : 16;
       let softCommandBudget = task.isSslTask ? 16 : taskComplexity === "complex" ? 80 : taskComplexity === "moderate" ? 40 : 12;
       const hardCommandLimit = task.isSslTask ? 32 : taskComplexity === "complex" ? 180 : taskComplexity === "moderate" ? 100 : 36;
       const homeDir = s2.username === "root" ? "/root" : `/home/${s2.username}`;
@@ -116605,6 +116607,8 @@ Tell the user to check that the agent script is still running in their terminal 
       let http200Confirmed = false;
       let lastBrowserFailCount = 0;
       let recoveryAttemptsTotal = 0;
+      const reasoningRecovery = new ReasoningRecoveryState(task.orchestration?.context?.reasoningRecovery || {});
+      let terminalReplanGranted = false;
       const ROLE_TIME_LIMITS_MS = {
         task_manager: 9e4,
         builder: 6e5,
@@ -116687,10 +116691,14 @@ Tell the user to check that the agent script is still running in their terminal 
         }
         if (totalCommands >= softCommandBudget && totalCommands > lastSoftBudgetSignal) {
           const repeatedFailure = consecutiveFailBatches >= 3 || [...cmdRunCount.values()].some((count) => count >= 3);
-          if (totalCommands >= hardCommandLimit && repeatedFailure) {
-            task.status = "partially_completed";
-            send2("reply", { text: "Partially completed. A hard loop guard stopped repeated equivalent failures. Completed work and remaining acceptance criteria were preserved." });
-            break;
+          if (totalCommands >= hardCommandLimit && repeatedFailure && !terminalReplanGranted) {
+            terminalReplanGranted = true;
+            maxIterations += 4;
+            softCommandBudget += 8;
+            const remaining = task.durableTaskDbId ? await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress','running') ORDER BY position", [task.durableTaskDbId]) : { rows: [] };
+            aiMessages.push({ role: "user", content: buildReplanCheckpoint({ objective: originalUserMessage, failure: "The command efficiency ceiling was reached with repeated equivalent failures.", state: reasoningRecovery, remainingAcceptance: remaining.rows.map((row) => row.title), availableTools: ["run_remote_command", "detect_hosting_environment"] }) });
+            chatTaskEmit(task, "strategy_replan", { reason: "command_budget_with_repeated_failure", failedStrategies: reasoningRecovery.toJSON().failedStrategies });
+            continue;
           }
           const previousBudget = softCommandBudget;
           softCommandBudget = Math.min(hardCommandLimit, softCommandBudget + (taskComplexity === "complex" ? 40 : taskComplexity === "moderate" ? 25 : 12));
@@ -116701,7 +116709,8 @@ Tell the user to check that the agent script is still running in their terminal 
         }
         if (aiMessages.length > 14) {
           const recent = aiMessages.slice(-10).map((message) => ({ ...message, content: String(message.content ?? "").slice(0, 6000) }));
-          aiMessages.splice(1, aiMessages.length - 1, { role: "user", content: `[COMPACT RUN CONTEXT]\nOriginal request: ${originalUserMessage.slice(0, 1200)}\nCompleted commands: ${totalCommands}. Current role: ${currentRole}. Continue from the latest results below; do not repeat prior inspection.` }, ...recent);
+          const todo = planState ? [...planState.current ? [planState.current] : [], ...(planState.queue || [])] : [];
+          aiMessages.splice(1, aiMessages.length - 1, { role: "user", content: buildCompactReasoningState({ objective: originalUserMessage, state: reasoningRecovery, todo }) }, ...recent);
         }
         // ── Check for new user messages injected via chat intercept ──
         const queueReview = await agentCollaborationRuntime?.queue?.reviewSafeBoundary({ conversationId, userId: task.userId, runDbId: task.durableRunDbId, taskDbId: task.durableTaskDbId, targetContext: task.targetContext || {} }).catch(() => null);
@@ -117486,9 +117495,16 @@ ${out}
           const unchangedCount = (commandResultCount.get(resultKey) ?? 0) + 1;
           commandResultCount.set(resultKey, unchangedCount);
           if (unchangedCount >= 2) {
-            task.status = "partially_completed";
-            send2("reply", { text: "Partially completed.\n\nNo-progress loop detected: equivalent commands returned unchanged results twice. Completed work was preserved." });
-            break;
+            const inferredStrategy = typeof action?.strategy === "string" ? action.strategy : cmds.some((c) => /certbot|acme\.sh/i.test(c.cmd)) ? "certificate_cli" : cmds.some((c) => /uapi|cpanel|autossl/i.test(c.cmd)) ? "cpanel_ssl" : `model_strategy_${iter}`;
+            reasoningRecovery.recordFailure({ strategy: inferredStrategy, actions: cmds.map((c) => c.cmd), evidence: resultText });
+            reasoningRecovery.recordFinding(`Equivalent results repeated for strategy ${inferredStrategy}; choose a different approach.`);
+            task.orchestration.context = { ...(task.orchestration.context || {}), reasoningRecovery: reasoningRecovery.toJSON() };
+            if (task.durableRunDbId) await pool.query("UPDATE coding_agent_runs SET metadata=COALESCE(metadata,'{}'::jsonb) || $2::jsonb, updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ reasoningRecovery: reasoningRecovery.toJSON() })]);
+            const remaining = task.durableTaskDbId ? await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress','running') ORDER BY position", [task.durableTaskDbId]) : { rows: [] };
+            aiMessages.push({ role: "assistant", content: raw });
+            aiMessages.push({ role: "user", content: buildReplanCheckpoint({ objective: originalUserMessage, failure: resultText, state: reasoningRecovery, remainingAcceptance: remaining.rows.map((row) => row.title), availableTools: ["run_remote_command", "detect_hosting_environment"] }) });
+            chatTaskEmit(task, "strategy_replan", { reason: "same_action_exhausted", strategy: inferredStrategy, unchangedCount });
+            continue;
           }
           aiMessages.push({ role: "assistant", content: raw });
           const allFailed = cmds.length > 0 && cmdResults.every((r2) => /\[(?:COMMAND_FAILURE|COMMAND_TIMEOUT); exit [^0]/.test(r2));
@@ -117499,6 +117515,11 @@ ${out}
             else await completeRunTask(task, { commandBatch: "completed", successfulCommands: cmdResults.filter((r2) => /\[(?:SUCCESS|NO_MATCH|DIFFERENCES_FOUND|CONDITION_FALSE); exit/.test(r2)).length });
           } else if (allFailed) {
             consecutiveFailBatches++;
+            const inferredStrategy = typeof action?.strategy === "string" ? action.strategy : cmds.some((c) => /certbot|acme\.sh/i.test(c.cmd)) ? "certificate_cli" : cmds.some((c) => /uapi|cpanel|autossl/i.test(c.cmd)) ? "cpanel_ssl" : `model_strategy_${iter}`;
+            const failureState = reasoningRecovery.recordFailure({ strategy: inferredStrategy, actions: cmds.map((c) => c.cmd), evidence: resultText });
+            task.orchestration.context = { ...(task.orchestration.context || {}), reasoningRecovery: reasoningRecovery.toJSON() };
+            if (task.durableRunDbId) await pool.query("UPDATE coding_agent_runs SET metadata=COALESCE(metadata,'{}'::jsonb) || $2::jsonb, updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ reasoningRecovery: reasoningRecovery.toJSON() })]);
+            if (failureState.strategyExhausted) chatTaskEmit(task, "strategy_exhausted", { strategy: inferredStrategy, signature: failureState.signature, evidence: resultText.slice(-1500) });
             if (task.isSslTask) await applySslRunEvidence(task, cmdResults);
           }
           const BLOCKER_PATTERNS = [
@@ -117604,19 +117625,10 @@ Then IMMEDIATELY continue building Phase ${newPhase}. Do NOT repeat work from co
             recoveryAttemptsTotal++;
             if (recoveryAttemptsTotal >= 2) {
               recoveryAttemptsTotal = 0;
-              send2("think", { text: "\u26A0\uFE0F Task failed after 2 recovery attempts \u2014 marking SKIPPED, advancing pipeline\u2026" });
-              aiMessages.push({
-                role: "user",
-                content: `\u26A0\uFE0F SKIP \u2014 this task has failed after 2 recovery attempts.
-
-ANTI-STUCK RULE: Fail = skip, not retry forever.
-
-1. Update ${stateDir}/state.json: move "current" to "failed[]", shift queue\u2192current
-2. If queue still has files \u2192 action="done" with "BUILT: <next-filename>"
-3. If queue is empty \u2192 action="done" with "ALL FILES COMPLETE (1 skipped: <filename>)"
-
-Do NOT re-plan. Do NOT rebuild. Just skip and continue the pipeline.`
-              });
+              const remaining = task.durableTaskDbId ? await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress','running') ORDER BY position", [task.durableTaskDbId]) : { rows: [] };
+              send2("think", { text: "The current approach is exhausted. Re-evaluating the evidence and selecting a different strategy." });
+              aiMessages.push({ role: "user", content: buildReplanCheckpoint({ objective: originalUserMessage, failure: resultText, state: reasoningRecovery, remainingAcceptance: remaining.rows.map((row) => row.title), availableTools: ["run_remote_command", "detect_hosting_environment"] }) });
+              chatTaskEmit(task, "strategy_replan", { reason: "recovery_strategy_exhausted", failedStrategies: reasoningRecovery.toJSON().failedStrategies });
             } else {
               currentRole = "recovery";
               roleStartedAt = Date.now();

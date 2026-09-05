@@ -9,11 +9,13 @@ test("non-streaming planner does not reference an undeclared transport stream", 
   assert.match(source, /const completion = await callWithRetry\(\)/);
 });
 
-test("server agent applies bounded cycle and command budgets", () => {
-  assert.match(source, /const maxIterations = task\.isSslTask \? 14 : taskComplexity/);
+test("server agent bounds actions while preserving model replanning", () => {
+  assert.match(source, /let maxIterations = task\.isSslTask \? 32 : taskComplexity/);
   assert.match(source, /let softCommandBudget = task\.isSslTask \? 16 : taskComplexity/);
   assert.match(source, /const hardCommandLimit = task\.isSslTask \? 32 : taskComplexity/);
-  assert.match(source, /No-progress loop detected/);
+  assert.match(source, /buildReplanCheckpoint/);
+  assert.match(source, /same_action_exhausted/);
+  assert.doesNotMatch(source, /Task failed after 2 recovery attempts/);
 });
 
 test("runtime failures log correlated stack details but return a safe message", () => {
