@@ -79,6 +79,7 @@
 <script>
 (function() {
   'use strict';
+  if (/^\/servers\/\d+\/chats(?:\/|$)/.test(location.pathname)) return;
   // ── XD Conversation Persistence Shim ─────────────────────────────────────
   // Stores conversationId per server so each new message reuses the same conversation.
   // Also stores runId so we can poll /runs/:runId to recover from stuck "Working..." state.
