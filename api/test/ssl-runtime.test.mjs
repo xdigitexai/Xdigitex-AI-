@@ -28,7 +28,7 @@ test("SSH authentication and failed Certbot never satisfy SSL acceptance", () =>
   const results = ["$ ssh wrapper\nauthenticated\n[SUCCESS; exit 0]", "$ certbot certonly\nunauthorized: challenge returned 404\n[COMMAND_FAILURE; exit 1]"]
   assert.deepEqual(sslEvidenceFromResults(results, "ogzensmm.online"), [])
   const outcome = canonicalRunResult({ requestedStatus: "completed", acceptance: deriveAcceptanceCriteria(request), todo: [] })
-  assert.equal(outcome.status, "PARTIALLY_VERIFIED")
+  assert.equal(outcome.status, "FAILED")
   assert.equal(outcome.complete, false)
 })
 

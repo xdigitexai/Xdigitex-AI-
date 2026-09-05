@@ -24,10 +24,10 @@ test("calling specialist routing loads realtime skills without unrelated github 
   assert.ok(!selected.skills.some(item => item.id === "github"))
 })
 
-test("canonical completion stays partial until every acceptance check has evidence", () => {
+test("canonical completion fails at zero evidence and becomes verified only with complete evidence", () => {
   const acceptance = deriveAcceptanceCriteria(callingRequest)
   const partial = canonicalRunResult({ requestedStatus: "completed", acceptance, todo: [], summary: "done" })
-  assert.equal(partial.status, "PARTIALLY_VERIFIED")
+  assert.equal(partial.status, "FAILED")
   assert.equal(partial.complete, false)
   const passed = acceptance.map(item => ({ ...item, status: "passed", evidence: ["browser test artifact"] }))
   assert.equal(canonicalRunResult({ requestedStatus: "completed", acceptance: passed, todo: [] }).status, "VERIFIED")
@@ -40,7 +40,7 @@ test("project root remains stable while a Prisma file is current", () => {
 test("professional final report is concise and derives its status", () => {
   const result = canonicalRunResult({ requestedStatus: "completed", acceptance: deriveAcceptanceCriteria(callingRequest), todo: [] })
   const report = professionalFinalReport({ result, title: conciseRunTitle(callingRequest, "Planète Libia"), summary: "STATUS: VERIFIED\nChecked the implementation.", durationMs: 65000, usage: { totalTokens: 1234, creditsUsed: 25 } })
-  assert.match(report, /^PARTIALLY VERIFIED/)
+  assert.match(report, /^FAILED/)
   assert.doesNotMatch(report, /STATUS: VERIFIED|REQUEST:/)
   assert.ok(report.length < 1800)
 })

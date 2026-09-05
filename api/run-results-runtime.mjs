@@ -61,7 +61,8 @@ export function canonicalRunResult({ requestedStatus, acceptance = [], todo = []
   const unfinished = todo.filter(item => !["completed", "skipped"].includes(item.status))
   const hasChanges = filesChanged.length > 0, inspectionOnly = !hasChanges && /inspect|review|search|read|diagnos/i.test(summary)
   if (!failed.length && !notTested.length && !unfinished.length && !unresolved.length) return { status: "VERIFIED", complete: true, passed: passed.length, total: required.length, inspectionOnly }
-  return { status: failed.length ? "PARTIALLY_VERIFIED" : "PARTIALLY_VERIFIED", complete: false, passed: passed.length, total: required.length, notTested: notTested.map(x => x.key), failed: failed.map(x => x.key), unfinished: unfinished.map(x => x.key), inspectionOnly }
+  const status = passed.length > 0 ? "PARTIALLY_VERIFIED" : failed.length ? "FAILED" : "FAILED"
+  return { status, complete: false, passed: passed.length, total: required.length, notTested: notTested.map(x => x.key), failed: failed.map(x => x.key), unfinished: unfinished.map(x => x.key), inspectionOnly }
 }
 
 export function conciseRunTitle(request, projectName) {

@@ -7,6 +7,7 @@ import { loadRegistrySelection, registryManifest } from './agent-engine/v1/regis
 import { canonicalRunResult, conciseRunTitle, deriveAcceptanceCriteria, detectRunType, isSslRequest, professionalFinalReport, requestSpecificTodo } from './run-results-runtime.mjs';
 import { compactSslResults, sslDomain, sslEvidenceFromResults, sslRecoveryFromResults } from './ssl-runtime.mjs';
 import { classifyStartupFailure, createStartupTrace, validateExecutableTodo } from './run-startup-runtime.mjs';
+import { EXECUTION_TOOL, normalizeModelTurn, partiallyVerifiedAllowed, validateRemoteToolCall } from './agent-tool-protocol.mjs';
 
 globalThis.require = __bannerCrReq(import.meta.url);
 globalThis.__filename = __bannerUrl.fileURLToPath(import.meta.url);
@@ -112305,6 +112306,8 @@ pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS final_respo
 pool.query(`ALTER TABLE server_task_history ADD COLUMN IF NOT EXISTS steps TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS client_message_id TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS task_id BIGINT REFERENCES agent_tasks(id) ON DELETE SET NULL`).catch(()=>{});
+pool.query(`ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'native'`).catch(()=>{});
 pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_client_unique ON conversation_messages(conversation_id,client_message_id) WHERE client_message_id IS NOT NULL`).catch(()=>{});
 pool.query(`CREATE TABLE IF NOT EXISTS agent_message_idempotency (conversation_id TEXT NOT NULL,user_id INTEGER NOT NULL,server_id INTEGER NOT NULL,client_message_id TEXT NOT NULL,run_id TEXT,task_id TEXT,created_at TIMESTAMP DEFAULT NOW(),PRIMARY KEY(conversation_id,client_message_id))`).catch(()=>{});
 pool.query(`CREATE INDEX IF NOT EXISTS conversations_server_last_idx ON conversations(server_id,last_message_at DESC)`).catch(()=>{});
@@ -112322,7 +112325,7 @@ function chatTaskEmit(task, type, payload) {
   task.eventBuffer.push({ type, payload });
   if ((type === "reply" || type === "done") && payload?.text) task.lastReply = payload.text;
   if (task?.durableRunDbId) {
-    const eventType = ({ run_started: "run.started", run_completed: "run.completed", run_failed: task.status === "cancelled" ? "run.cancelled" : task.status === "blocked" ? "run.blocked" : task.status === "partially_completed" ? "run.partially_completed" : "run.failed", run_blocked: "run.blocked", xd_plan: "task.created", plan_generated: "todo.created", todo_discovered: "todo.created", target_context: "target.updated", task_start: "todo.started", task_complete: "todo.completed", task_failed_item: "todo.failed", ssh: "tool.output", step: "task.updated", reply: "assistant.progress", done: "assistant.final", error: "tool.failed", stream_end: "stream.end" })[type] ?? `legacy.${type}`;
+    const eventType = ({ run_started: "run.started", run_completed: "run.completed", run_failed: task.status === "cancelled" ? "run.cancelled" : task.status === "blocked" ? "run.blocked" : task.status === "partially_completed" ? "run.partially_completed" : "run.failed", run_blocked: "run.blocked", xd_plan: "task.created", plan_generated: "todo.created", todo_discovered: "todo.created", target_context: "target.updated", task_start: "todo.started", task_complete: "todo.completed", task_failed_item: "todo.failed", tool_requested: "tool.requested", tool_started: "tool.started", tool_completed: "tool.completed", tool_failed: "tool.failed", ssh: "tool.output", step: "task.updated", reply: "assistant.progress", done: "assistant.final", error: "tool.failed", stream_end: "stream.end" })[type] ?? `legacy.${type}`;
     pool.query(
       `INSERT INTO agent_run_events(run_id,sequence,type,payload)
        SELECT $1,COALESCE(MAX(sequence),0)+1,$2,$3 FROM agent_run_events WHERE run_id=$1`,
@@ -112516,7 +112519,7 @@ async function bridgeServerAgentRunFinish(task) {
   const acceptance = task.acceptance || [];
   const canonical = task.canonicalResult || canonicalRunResult({ requestedStatus: task.status, acceptance, todo: task.acceptanceCritical ? [] : taskRows.rows, filesChanged: task.filesModified || [], unresolved: task.orchestration?.context?.unresolved || [], summary: task.lastReply || "" });
   task.canonicalResult = { ...canonical, title: task.runTitle, acceptance, completedTasks: taskRows.rows.filter(row => row.status === "completed").length, totalTasks: taskRows.rows.length };
-  if (task.status === "running" || task.status === "completed") task.status = canonical.complete ? "completed" : "partially_completed";
+  if (task.status === "running" || task.status === "completed") task.status = canonical.complete ? "completed" : partiallyVerifiedAllowed(acceptance) ? "partially_completed" : "failed";
   const failed = task.status === "failed" || task.status === "error";
   const cancelled = task.status === "cancelled";
   const blocked = task.status === "blocked";
@@ -113395,10 +113398,10 @@ The user would rather hear "I could not complete this" than receive a fabricated
 A fabricated success = immediate total loss of user trust. Do not do it. Ever.
 
 \u{1F6A8} OUTPUT FORMAT ABSOLUTE RULE \u{1F6A8}
-Your ONLY valid output is a single JSON object: {"thought":"...","action":"...","commands":[...],"message":"..."}
-NEVER output XML tags, tool_calls blocks, <\uFF5C\uFF5CDSML\uFF5C\uFF5C> syntax, function_call blocks, or ANY markup.
-NEVER use your model's native tool-call format. This system does not use tool calls \u2014 it reads your JSON text directly.
-If you output anything other than plain JSON, your response will be discarded and the task will fail.
+For server execution, your only valid action is a native run_remote_command tool call. Return normal assistant text only for the final response.
+Never print XML, DSML, function-call markup, or a textual tool_calls block. Invoke the provided API tool directly.
+Use the native run_remote_command tool for server commands. Never print command JSON as a substitute for a tool call.
+Do not expose internal tool protocol or command JSON to the user.
 
 \u2550\u2550\u2550 RESPONSE FORMAT \u2014 strict JSON only \u2550\u2550\u2550
 {"thought":"...","action":"run"|"browse"|"research"|"reply"|"done","commands":[{"cmd":"...","desc":"..."}],"message":"..."}
@@ -116396,8 +116399,8 @@ void (async () => {
       // ─────────────────────────────────────────────────────────────────────
       }
       const xd_readOnlyTask = /\b(check|inspect|status|report|show|list|verify|diagnose)\b/i.test(userTaskText) && (/\b(?:do not|don't|without)\s+(?:make\s+)?(?:any\s+)?(?:changes?|modify|restart|reload|write|install|configure|deploy|delete|remove|update)\b/i.test(userTaskText) || !/\b(fix|change|modify|write|create|install|restart|reload|deploy|delete|remove|update|configure)\b/i.test(userTaskText));
-      const xd_compactServerPrompt = `You are XDIGITEX Server Agent connected only to ${s2.username}@${s2.host}:${s2.port}. Complete the user's read-only request autonomously. Use the minimum targeted commands and never modify files, configuration, services, SSH settings, authentication, or firewall rules. Every command must have a timeout. Do not repeat an unchanged command. Respond with exactly one JSON object per turn: {"thought":"short user-facing progress","action":"run","commands":[{"cmd":"timeout 30 <read-only command>","desc":"purpose"}]} or, only after the requested behavior is verified, {"thought":"verified","action":"done","message":"Completed.\\n\\nFindings:\\n...\\n\\nVerification:\\n..."}. A command completing is not the task completing; continue until all parts of the request are checked. Keep output concise and never expose internal notes.`;
-      const xd_compactSslPrompt = `You are the XDIGITEX Infrastructure/SSL specialist connected through the owned server record. Install and verify SSL only for ${task.sslDomain}. Use a bounded sequence: compare DNS A/AAAA with the bound server; detect Nginx, Apache, LiteSpeed, OpenLiteSpeed or cPanel; identify the exact vhost/document root; inspect the existing SNI certificate; verify a temporary scoped ACME challenge; choose Certbot, webroot, AutoSSL or cPanel API from the detected environment; issue and bind the certificate; validate server configuration before a scoped reload; remove the challenge file; verify SAN, expiry, chain, normal HTTPS, correct site and renewal. A 404 is recoverable: diagnose and fix its route automatically. Never inspect application source or Git history, never touch another domain, never alter SSH/firewall, never expose private keys, never use -k/--insecure as final proof, and never ask whether to continue safe recovery. Respond with one JSON action and concise commands. Do not emit done until every acceptance criterion has evidence; otherwise report only a verified external blocker or unrecoverable failure.`;
+      const xd_compactServerPrompt = `You are XDIGITEX Server Agent connected only to ${s2.username}@${s2.host}:${s2.port}. Complete the user's read-only request autonomously. Use run_remote_command for the minimum targeted commands and never modify files, configuration, services, SSH settings, authentication, or firewall rules. Do not repeat an unchanged command. A command completing is not the task completing; continue until all parts are checked. Return user-facing text only when finished.`;
+      const xd_compactSslPrompt = `You are the XDIGITEX Infrastructure/SSL specialist connected through the owned server record. Install and verify SSL only for ${task.sslDomain}. Use run_remote_command and a bounded sequence: compare DNS A/AAAA with the bound server; detect Nginx, Apache, LiteSpeed, OpenLiteSpeed or cPanel; identify the exact vhost/document root; inspect the existing SNI certificate; verify a temporary scoped ACME challenge; choose Certbot, webroot, AutoSSL or cPanel API from the detected environment; issue and bind the certificate; validate server configuration before a scoped reload; remove the challenge file; verify SAN, expiry, chain, normal HTTPS, correct site and renewal. A 404 is recoverable: diagnose and fix its route automatically. Never inspect application source or Git history, never touch another domain, never alter SSH/firewall, never expose private keys, never use -k/--insecure as final proof, and never ask whether to continue safe recovery. Never print command JSON. Do not return a final answer until every acceptance criterion has evidence; otherwise report only a verified external blocker or unrecoverable failure.`;
       var xd_finalSysPrompt = task.isSslTask ? `${xd_skRes.block}\n\n${xd_compactSslPrompt}` : xd_readOnlyTask ? xd_compactServerPrompt : (xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt);
       task.startupStage = "task.start"; task.startupTrace?.mark(task.startupStage, { taskKey: task.orchestration?.context?.todo?.find(item => item.status === "in_progress")?.key || null });
       if (task.durableRunDbId) pool.query("UPDATE coding_agent_runs SET phase='running',metadata=metadata||$2::jsonb,updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ startup: { stage: task.startupStage, trace: task.startupTrace?.entries || [] } })]).catch(() => {});
@@ -116407,7 +116410,7 @@ void (async () => {
         { role: "system", content: xd_finalSysPrompt },
         ...(task.isSslTask ? [{ role: "user", content: userTaskText.slice(0, 1200) }] : parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content })))
       ];
-      aiMessages.push({ role: "user", content: `[REMOTE EXECUTION CONTRACT]\nYou are already connected through the owned server record (serverId ${s2.id}) and its saved ${s2.authType ?? "key"} credential. Every action=run command executes remotely through the backend SSH connection service. Never run ssh, sshpass, scp, sftp, or construct username@host authentication commands. Supply only the command that should execute on the connected server.` });
+      aiMessages.push({ role: "user", content: `[REMOTE EXECUTION CONTRACT]\nYou are already connected through the owned server record (serverId ${s2.id}) and its saved ${s2.authType ?? "key"} credential. Call run_remote_command for execution. Never run ssh, sshpass, scp, sftp, or construct username@host authentication commands. The backend owns credentials and returns structured results.` });
       if (task.attachmentContext?.length) aiMessages.push({ role: "user", content: `[ATTACHMENT REFERENCES]\nUse only attachments relevant to the active specialist. Uploading a file does not authorize execution. ZIP manifests are lazy-inspected and archive contents must not be broadly injected into context.\n${task.attachmentContext.map(file => `- ${file.public_id}: ${file.name} (${file.mime_type}, ${file.size_bytes} bytes)${file.comment ? ` — ${file.comment}` : ""}; status=${file.processing_status}; routed=${(file.metadata?.specialists || []).join(",")}${file.manifest ? `; manifest=${JSON.stringify(file.manifest).slice(0, 3000)}` : ""}${file.preview ? `; preview=${String(file.preview).slice(0, 3000)}` : ""}`).join("\n")}` });
       if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText)) aiMessages.push({ role: "user", content: `[PROFESSIONAL DEPLOYMENT CONTRACT]\nWork manifest-first and stay bounded: inspect only existing deployment manifests, package/runtime manifests, README deployment instructions, environment examples, and the actual entry point before reading source. Detect Docker/Compose before reconstructing a manual deployment. Cache the discovered stack, package manager, project root, process manager, web server, application bind and port; do not rediscover unchanged facts. Treat every project as isolated and never stop another project to obtain a preferred port.\n\nExplicitly distinguish the connected execution target (VPS, cPanel/shared hosting, or local computer) from browser verification. On a VPS, detect whether the app listens on loopback or a public interface and perform the correct origin check from the VPS. On cPanel, discover the requested domain's real document root; never assume public_html. Origin health is never final website health. The final website check uses the actual HTTPS hostname (or curl --resolve with hostname/SNI while DNS propagates), without --insecure.\n\nBefore deployment, derive expected behavior from the repository: API-only, frontend, or full-stack, plus at least one recognizable title, brand, root element, or asset. For frontend/full-stack work, inspect the public response body and separately verify referenced JavaScript/CSS/assets; JSON health at / and PM2 online do not prove a frontend deployment. Verify the API separately when present. If the public root serves an API, default page, stale app, blank shell, or broken assets instead of the expected frontend, fix routing and continue. Use a real browser when available for final render verification.\n\nComplete safe prerequisites autonomously. If DATABASE_URL is missing, inspect the actual ORM/schema/migrations, provision an isolated database and application user when safe, configure secrets without printing them, migrate, restart only the target process, and verify fresh logs and database-backed behavior. Add newly discovered requirements to the durable TODO immediately. Finish only when the requested application is accessible at its requested destination, or report the exact external blocker and preserved state.` });
       if (requestedDomain && !task.isSslTask) aiMessages.push({ role: "user", content: `[DOMAIN TARGET BINDING]\nSSH execution target: ${s2.username}@${s2.host}:${s2.port}. Website target: https://${requestedDomain}${requestedWebPath}. These are different identities: the server IP can serve a default virtual host and an HTTP 403 from the raw IP does not mean the requested domain failed. The expected project root is /home/${s2.username}/${requestedDomain}; stay inside that root unless direct evidence proves a different document root. Search requested literals with grep -nF, not regex grep. Verify the hostname URL first; if DNS routing is unavailable, use curl --resolve ${requestedDomain}:443:${s2.host} https://${requestedDomain}${requestedWebPath}. A login redirect can be valid behavior. For a small source change, exact source/literal evidence plus the relevant syntax check is sufficient; a browser screenshot is optional and its absence must not force PARTIAL. Once the requested state and relevant verification pass, emit done immediately without extra discovery commands.` });
@@ -116964,7 +116967,7 @@ After fixing, verify the file works, then action="done".`
           });
         }
         const MODEL_CALL_TIMEOUT_MS = 18e4;
-        const callOnce = async (client, model) => {
+        const callOnce = async (client, model, providerName = iterProvider) => {
           const maxTok = currentRole === "ui_builder" ? 32768 : 8192;
           const ac = new AbortController();
           const timer = setTimeout(() => ac.abort(new Error(`Model ${model} timed out after ${MODEL_CALL_TIMEOUT_MS / 1e3}s`)), MODEL_CALL_TIMEOUT_MS);
@@ -116972,10 +116975,13 @@ After fixing, verify the file works, then action="done".`
             const result = await client.chat.completions.create({
               model,
               messages: (/glm|z-ai/i.test(model) ? (()=>{ const LIM=27000; const totalLen=m=>m.reduce((s,x)=>s+String(x.content??"").length,0); const sys=aiMessages.filter(m=>m.role==="system"); let rest=aiMessages.filter(m=>m.role!=="system"); while(rest.length>1&&totalLen([...sys,...rest])>LIM)rest=rest.slice(1); let res=[...sys,...rest]; if(totalLen(res)>LIM&&sys.length>0){const budget=LIM-totalLen(rest); const ts={...sys[0],content:String(sys[0].content??"").slice(0,Math.max(0,budget-200))}; res=[ts,...rest];} return res; })() : aiMessages),
+              tools: hasSsh ? [EXECUTION_TOOL] : undefined,
+              tool_choice: hasSsh ? "auto" : undefined,
               max_tokens: maxTok,
               temperature: iter === 0 ? 0.3 : 0.1,
               signal: ac.signal
             });
+            Object.defineProperties(result, { _xdProvider: { value: providerName, enumerable: false }, _xdModel: { value: model, enumerable: false } });
             return result;
           } finally {
             clearTimeout(timer);
@@ -117035,30 +117041,30 @@ After fixing, verify the file works, then action="done".`
             send2("think", { text: `\u{1F500} Switching to backup agent` });
             try {
               const backupClient = getAIClient(backup.provider);
-              return await callOnce(backupClient, backup.model);
+              return await callOnce(backupClient, backup.model, backup.provider);
             } catch (_backupErr) {
               send2("think", { text: `\u26A0\uFE0F Agent unavailable \u2014 trying next agent` });
               const tertiary = autoTertiaryModel(currentRole);
               try {
                 const tertiaryClient = getAIClient(tertiary.provider);
-                return await callOnce(tertiaryClient, tertiary.model);
+                return await callOnce(tertiaryClient, tertiary.model, tertiary.provider);
               } catch (_tertiaryErr) {
                 send2("think", { text: `\u26A0\uFE0F Agent unavailable \u2014 trying next agent` });
                 const quaternary = autoQuaternaryModel(currentRole);
                 try {
                   const quaternaryClient = getAIClient(quaternary.provider);
-                  return await callOnce(quaternaryClient, quaternary.model);
+                  return await callOnce(quaternaryClient, quaternary.model, quaternary.provider);
                 } catch (_quaternaryErr) {
                   if (process.env["OPENAI_API_KEY"]) {
                     try {
-                      return await callOnce(getAIClient("openai"), cheapOpenAIModel().model);
+                      return await callOnce(getAIClient("openai"), cheapOpenAIModel().model, "openai");
                     } catch (_nanoLunaErr) {
                     }
                   }
                   const final = universalLastResortModel();
                   try {
                     const finalClient = getAIClient(final.provider);
-                    return await callOnce(finalClient, final.model);
+                    return await callOnce(finalClient, final.model, final.provider);
                   } catch (_finalErr) {
                     send2("think", { text: `\u274C All agents exhausted \u2014 will retry next iteration` });
                   }
@@ -117070,18 +117076,18 @@ After fixing, verify the file works, then action="done".`
             const backup2 = autoQuaternaryModel(currentRole);
             try {
               const backup2Client = getAIClient(backup2.provider);
-              return await callOnce(backup2Client, backup2.model);
+              return await callOnce(backup2Client, backup2.model, backup2.provider);
             } catch (_backup2Err) {
               if (process.env["OPENAI_API_KEY"]) {
                 try {
-                  return await callOnce(getAIClient("openai"), cheapOpenAIModel().model);
+                  return await callOnce(getAIClient("openai"), cheapOpenAIModel().model, "openai");
                 } catch (_nanoLuna2Err) {
                 }
               }
               const lastResort = universalLastResortModel();
               try {
                 const lastResortClient = getAIClient(lastResort.provider);
-                return await callOnce(lastResortClient, lastResort.model);
+                return await callOnce(lastResortClient, lastResort.model, lastResort.provider);
               } catch (_lastResortErr) {
                 send2("think", { text: `\u274C Fallback agent also failed \u2014 will retry next iteration` });
               }
@@ -117120,15 +117126,35 @@ After fixing, verify the file works, then action="done".`
           break;
         }
         const completion = await callWithRetry();
-        await settleServerAgentCredits(task, creditLedger, completion.usage, iterProvider, iterModel);
+        const actualProvider = completion._xdProvider || iterProvider, actualModel = completion._xdModel || iterModel;
+        await settleServerAgentCredits(task, creditLedger, completion.usage, actualProvider, actualModel);
+        chatTaskEmit(task, "provider_turn", { primaryProvider: iterProvider, primaryModel: iterModel, provider: actualProvider, model: actualModel, fallback: actualProvider !== iterProvider || actualModel !== iterModel, toolsPassed: hasSsh ? 1 : 0, toolChoice: hasSsh ? "auto" : null, finishReason: completion.choices[0]?.finish_reason, toolCallCount: completion.choices[0]?.message?.tool_calls?.length || 0 });
+        iterProvider = actualProvider; iterModel = actualModel;
         if (completion.usage) {
           totalPromptTokens += completion.usage.prompt_tokens ?? 0;
           totalCompletionTokens += completion.usage.completion_tokens ?? 0;
           lastCompletionTokens = completion.usage.completion_tokens ?? 0;
         }
         totalIterations++;
-        const raw = completion.choices[0]?.message?.content ?? "";
-        const action = parseAgentJSON(raw);
+        const modelMessage = completion.choices[0]?.message ?? { role: "assistant", content: "" };
+        const normalizedTurn = normalizeModelTurn(modelMessage, { executionContext: hasSsh, finishReason: completion.choices[0]?.finish_reason });
+        let raw = normalizedTurn.text;
+        let action = null;
+        if (normalizedTurn.toolCalls.length) {
+          const commands = [];
+          for (const call of normalizedTurn.toolCalls) {
+            const checked = validateRemoteToolCall(call);
+            if (!checked.valid) {
+              aiMessages.push(modelMessage, { role: "tool", tool_call_id: call.id, content: JSON.stringify({ success: false, code: checked.code, error: checked.message }) });
+              chatTaskEmit(task, "tool_failed", { toolCallId: call.id, toolName: call.name, code: checked.code, source: call.source });
+              continue;
+            }
+            commands.push({ cmd: checked.value.command, desc: checked.value.description, __toolCallId: call.id, __toolSource: call.source });
+            chatTaskEmit(task, "tool_requested", { toolCallId: call.id, toolName: call.name, summary: checked.value.description, source: call.source, taskId: task.durableTaskDbId });
+          }
+          if (commands.length) action = { action: "run", thought: commands[0].desc, commands };
+          raw = JSON.stringify(action ?? { action: "continue" });
+        } else action = parseAgentJSON(raw);
         if (isAuto && action && iter > 0 && (currentRole === "builder" || currentRole === "ui_builder")) {
           const thoughtStr = (action.thought ?? "").toLowerCase();
           const hasCommands = Array.isArray(action.commands) && action.commands.length > 0;
@@ -117142,6 +117168,16 @@ cat ${stateDir}/state.json \u2014 get the "current" file name.
 Write that ONE file to disk NOW. Then action="done" with "BUILT: <filename>".
 No roadmaps. No plans. ONE FILE.`
             });
+            continue;
+          }
+        }
+        if (!action && normalizedTurn.source === "assistant_text" && raw.trim()) {
+          const requiredAcceptance = (task.acceptance || []).filter(item => item.required !== false);
+          const finalEligible = requiredAcceptance.length > 0 && requiredAcceptance.every(item => item.status === "passed" && Array.isArray(item.evidence) && item.evidence.length > 0);
+          if (finalEligible) action = { action: "done", message: raw.trim() };
+          else if (hasSsh) {
+            aiMessages.push({ role: "assistant", content: raw.trim() }, { role: "user", content: "The run is not eligible to finish: required TODO or acceptance evidence remains. Continue using run_remote_command. Do not print command JSON and do not ask the user to type continue." });
+            chatTaskEmit(task, "tool_failed", { code: "PROVIDER_TOOL_PROTOCOL_FAILURE", provider: iterProvider, model: iterModel, finishReason: normalizedTurn.finishReason, toolCallCount: 0 });
             continue;
           }
         }
@@ -117322,6 +117358,8 @@ DO NOT repeat these commands again.`;
               break;
             }
             let { cmd, desc: desc3 } = cmds[ci];
+            const protocolCallId = cmds[ci].__toolCallId || randomUUID2();
+            const protocolSource = cmds[ci].__toolSource || "legacy_json_compat";
             if (task.isSslTask && /\b(?:certbot|acme\.sh)\b.*\b(?:certonly|run|install|issue)\b/i.test(cmd)) {
               if (lastSslIssueMutationEpoch === mutationEpoch) {
                 cmdResults.push(`$ ${cmd}\n[SSL_RETRY_BLOCKED]\nCertificate issuance was not retried because DNS, vhost, challenge routing, or certificate binding has not changed.\n[exit 75]`);
@@ -117361,6 +117399,11 @@ DO NOT repeat these commands again.`;
               }
             }
             trackFileWrites(cmd, task);
+            let durableToolCall = null;
+            if (task.durableRunDbId) {
+              durableToolCall = (await pool.query(`INSERT INTO agent_tool_calls(public_id,run_id,task_id,name,status,risk,input,started_at,source) VALUES($1,$2,$3,'run_remote_command','running','dynamic',$4,NOW(),$5) RETURNING id,public_id`, [protocolCallId, task.durableRunDbId, task.durableTaskDbId, JSON.stringify(redactSecrets({ serverId: s2.id, command: cmd, description: desc3 })), protocolSource])).rows[0];
+            }
+            chatTaskEmit(task, "tool_started", { toolCallId: protocolCallId, toolName: "run_remote_command", summary: desc3 || "Running server command", taskId: task.durableTaskDbId, source: protocolSource });
             send2("cmd_start", { index: ci, total: cmds.length, cmd, desc: desc3 });
             const result = await executeServerCommand(s2, cmd, {
               onData: (chunk) => send2("cmd_output", { index: ci, chunk }),
@@ -117379,6 +117422,8 @@ DO NOT repeat these commands again.`;
             const commandName = /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)grep(?:\s|$)/i.test(cmd) ? "grep" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)diff(?:\s|$)/i.test(cmd) ? "diff" : /(?:^|[;&|]\s*|\btimeout\s+\d+\s+)(?:test|\[)(?:\s|$)/i.test(cmd) ? "test" : cmd.trim().match(/^(?:timeout\s+\d+\s+)?(?:env\s+\S+\s+)*([\w.-]+)/)?.[1]?.toLowerCase() ?? "";
             const toolClassification = result.code === 124 ? "COMMAND_TIMEOUT" : commandName === "grep" && result.code === 1 ? "NO_MATCH" : commandName === "grep" && result.code === 2 ? "TOOL_SYNTAX_ERROR" : commandName === "diff" && result.code === 1 ? "DIFFERENCES_FOUND" : commandName === "test" && result.code === 1 ? "CONDITION_FALSE" : result.code === 0 ? "SUCCESS" : "COMMAND_FAILURE";
             send2("cmd_done", { index: ci, code: result.code, classification: toolClassification });
+            if (durableToolCall) await pool.query("UPDATE agent_tool_calls SET status=$2,result=$3,duration_ms=$4,completed_at=NOW() WHERE id=$1", [durableToolCall.id, result.code === 124 ? "timeout" : result.code === 0 ? "completed" : "failed", JSON.stringify(redactSecrets({ exitCode: result.code, stdout: result.stdout, stderr: result.stderr, classification: toolClassification })), null]);
+            chatTaskEmit(task, result.code === 0 ? "tool_completed" : "tool_failed", { toolCallId: protocolCallId, toolName: "run_remote_command", exitCode: result.code, classification: toolClassification, taskId: task.durableTaskDbId, source: protocolSource });
             if (toolClassification === "COMMAND_FAILURE" || toolClassification === "COMMAND_TIMEOUT") unresolvedCommandFailures.add(normCmd(cmd));
             else unresolvedCommandFailures.delete(normCmd(cmd));
             const rawOut = [
@@ -117884,7 +117929,11 @@ ALL BROWSER STEPS PASSED (${steps.length}/${steps.length}).`,
           }
           send2("think", { text: "Running command on connected local computer…" });
           const localResult = await sendCommand(s2.userId, "terminal.run", { command: action.command, cwd: action.cwd }, 12e4);
-          aiMessages.push({ role: "assistant", content: raw });
+          if (normalizedTurn.toolCalls.length) {
+            const assistantToolCalls = normalizedTurn.toolCalls.map(call => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) } }));
+            aiMessages.push({ role: "assistant", content: modelMessage.content || null, tool_calls: assistantToolCalls });
+            for (let ti = 0; ti < assistantToolCalls.length; ti++) aiMessages.push({ role: "tool", tool_call_id: assistantToolCalls[ti].id, content: JSON.stringify({ tool: "run_remote_command", result: cmdResults[ti] ?? "No result returned" }) });
+          } else aiMessages.push({ role: "assistant", content: raw });
           aiMessages.push({ role: "user", content: `LOCAL TERMINAL RESULT (targetType=local,targetId=desktop_${s2.userId}):\n${JSON.stringify(redactSecrets(localResult)).slice(0, 12000)}` });
         } else if (action.action === "local_files" && Array.isArray(action.operations) && action.operations.length) {
           if (!isConnected(s2.userId)) {
