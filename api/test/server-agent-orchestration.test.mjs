@@ -16,6 +16,7 @@ test("server agent bounds actions while preserving model replanning", () => {
   assert.match(source, /buildReplanCheckpoint/);
   assert.match(source, /same_action_exhausted/);
   assert.doesNotMatch(source, /Task failed after 2 recovery attempts/);
+  assert.doesNotMatch(source, /task stopped after bounded recovery attempts/i);
 });
 
 test("runtime failures log correlated stack details but return a safe message", () => {

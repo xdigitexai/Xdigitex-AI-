@@ -112534,7 +112534,7 @@ async function bridgeServerAgentRunFinish(task) {
   const blocked = task.status === "blocked";
   const partial = task.status === "partially_completed";
   const status = cancelled ? "cancelled" : blocked ? "blocked" : partial ? "partially_completed" : failed ? "failed" : "completed";
-  let finalText = task.lastReply || (cancelled ? "Cancelled. Completed work was preserved and the conversation remains available." : blocked ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : partial ? "Partially completed. Review the completed work and outstanding verification in Task History." : failed ? "Failed. The task stopped after bounded recovery attempts. Review Task History for the final error." : "Completed. Review Task History for actions and verification evidence.");
+  let finalText = task.lastReply || (cancelled ? "Cancelled. Completed work was preserved and the conversation remains available." : blocked ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : partial ? "Partially completed. Review the completed work and outstanding verification in Task History." : failed ? "Failed after replanning found no verified authorized path. Review Task History for the final evidence." : "Completed. Review Task History for actions and verification evidence.");
   if (canonical.status === "PARTIALLY_VERIFIED" && /\b(?:status\s*:\s*)?verified\b/i.test(finalText)) finalText = professionalFinalReport({ result: canonical, title: task.runTitle, summary: "The run stopped without sufficient evidence for every required acceptance check.", filesChanged: task.filesModified || [], durationMs: Date.now() - task.startedAt.getTime(), usage: { totalTokens: (task.inputTokens || 0) + (task.outputTokens || 0), creditsUsed: task.creditsUsed || 0, costUsd: task.costUsd || 0 } });
   const client = await pool.connect();
   try { await client.query("BEGIN");
@@ -118860,7 +118860,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
         task.canonicalResult ||= { ...result, title: task.runTitle, acceptance: task.acceptance || [] };
         task.status = result.complete ? "completed" : "partially_completed";
       }
-      if (!task.lastReply) chatTaskEmit(task, "reply", { text: task.status === "completed" ? "Completed. The requested work finished; see Task History for the recorded actions and verification." : task.status === "cancelled" ? "Cancelled. Completed work was preserved." : task.status === "blocked" ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : "Failed. The task stopped after bounded recovery attempts." });
+      if (!task.lastReply) chatTaskEmit(task, "reply", { text: task.status === "completed" ? "Completed. The requested work finished; see Task History for the recorded actions and verification." : task.status === "cancelled" ? "Cancelled. Completed work was preserved." : task.status === "blocked" ? "Blocked. Insufficient credits. Please add credits to continue using the AI Coding Agent." : "Failed after replanning found no verified authorized path. Review Task History for the final evidence." });
       // Emit lifecycle event + persist to DB
       try {
         const _runFailed = task.status === "failed" || task.status === "error" || task.status === "cancelled" || task.status === "blocked" || task.status === "partially_completed";
