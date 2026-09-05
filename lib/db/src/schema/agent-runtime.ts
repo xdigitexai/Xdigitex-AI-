@@ -139,3 +139,27 @@ export const scopedAgentMemoryTable = pgTable("agent_scoped_memory", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 }, (t) => [uniqueIndex("agent_scoped_memory_scope_uidx").on(t.userId, t.scopeType, t.scopeId, t.key)]);
+
+export const instructionQueueTable = pgTable("agent_instruction_queue", {
+  id: serial("id").primaryKey(), publicId: text("public_id").notNull().unique(),
+  conversationId: integer("conversation_id").notNull().references(() => conversationsTable.id, { onDelete: "cascade" }),
+  activeRunId: integer("active_run_id").references(() => agentRunsTable.id, { onDelete: "set null" }),
+  userId: integer("user_id").notNull().references(() => usersTable.id, { onDelete: "cascade" }),
+  content: text("content").notNull(), attachmentIds: jsonb("attachment_ids").notNull().default([]),
+  status: text("status").notNull().default("queued"), classification: text("classification"), priority: integer("priority").notNull().default(0),
+  position: integer("position").notNull(), version: integer("version").notNull().default(1), reasonCode: text("reason_code"),
+  appliedAt: timestamp("applied_at", { withTimezone: true }), completedAt: timestamp("completed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(), updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [uniqueIndex("agent_instruction_queue_position_uidx").on(t.conversationId, t.position), index("agent_instruction_queue_active_idx").on(t.conversationId, t.status, t.priority, t.position)]);
+
+export const chatAttachmentsTable = pgTable("chat_attachments", {
+  id: serial("id").primaryKey(), publicId: text("public_id").notNull().unique(),
+  userId: integer("user_id").notNull().references(() => usersTable.id, { onDelete: "cascade" }),
+  conversationId: integer("conversation_id").notNull().references(() => conversationsTable.id, { onDelete: "cascade" }),
+  messageId: integer("message_id").references(() => conversationMessagesTable.id, { onDelete: "set null" }),
+  runId: integer("run_id").references(() => agentRunsTable.id, { onDelete: "set null" }), queuedInstructionId: integer("queued_instruction_id").references(() => instructionQueueTable.id, { onDelete: "set null" }),
+  name: text("name").notNull(), mimeType: text("mime_type").notNull(), sizeBytes: numeric("size_bytes", { precision: 16, scale: 0 }).notNull(),
+  storageRef: text("storage_ref").notNull(), sha256: text("sha256").notNull(), comment: text("comment"), processingStatus: text("processing_status").notNull().default("uploaded"),
+  preview: text("preview"), manifest: jsonb("manifest"), metadata: jsonb("metadata").notNull().default({}), processedAt: timestamp("processed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(), updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (t) => [index("chat_attachments_conversation_idx").on(t.conversationId, t.createdAt)]);

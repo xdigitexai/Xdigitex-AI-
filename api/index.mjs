@@ -112465,7 +112465,13 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
     const message = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,role,content,sequence,metadata) VALUES($1,$2,'user',$3,$4,$5) RETURNING id`, [randomUUID2(), conversationDbId, prompt, sequence, JSON.stringify({ source: "server-agent", serverId: server.id })]);
     const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, triggerMessageId: message.rows[0].id, originalRequest: promptText, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username, targetContext })]);
     task.durableRunDbId = run.rows[0].id; task.durableConversationDbId = conversationDbId;
+    if (task.queueInstructionId) await client.query("UPDATE agent_instruction_queue SET active_run_id=$1,status='running',updated_at=NOW() WHERE public_id=$2 AND conversation_id=$3 AND user_id=$4", [task.durableRunDbId, task.queueInstructionId, conversationDbId, task.userId]);
     await client.query("UPDATE conversation_messages SET run_id=$2 WHERE id=$1", [message.rows[0].id, task.durableRunDbId]);
+    if (task.attachmentIds?.length) {
+      const attached = await client.query("UPDATE chat_attachments SET message_id=$1,run_id=$2,updated_at=NOW() WHERE public_id=ANY($3) AND user_id=$4 AND conversation_id=$5 AND message_id IS NULL RETURNING public_id,name,mime_type,size_bytes,comment,processing_status,manifest,preview,metadata", [message.rows[0].id, task.durableRunDbId, task.attachmentIds, task.userId, conversationDbId]);
+      task.attachmentContext = attached.rows;
+      await client.query("UPDATE conversation_messages SET metadata=metadata||$2::jsonb WHERE id=$1", [message.rows[0].id, JSON.stringify({ attachmentIds: attached.rows.map(row => row.public_id) })]);
+    }
     const taskItems = context.todo;
     const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify(taskItems.map(({ title, owner }) => ({ title, owner, required: true }))), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true, orchestratorVersion: selection.version })]);
     task.durableTaskDbId = plan.rows[0].id;
@@ -112498,6 +112504,7 @@ async function bridgeServerAgentRunFinish(task) {
     const final = await client.query(`INSERT INTO conversation_messages(public_id,conversation_id,run_id,role,content,sequence,metadata) VALUES($1,$2,$3,'assistant',$4,$5,$6) RETURNING id`, [randomUUID2(), task.durableConversationDbId, task.durableRunDbId, finalText, sequence, JSON.stringify({ final: true, status, filesModified: task.filesModified ?? [] })]);
     await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ finalMessageId: final.rows[0].id, actionCount: task.timeline?.length ?? 0, filesModified: task.filesModified ?? [], usage: { inputTokens: task.inputTokens ?? 0, cachedInputTokens: task.cachedTokens ?? 0, outputTokens: task.outputTokens ?? 0, reasoningTokens: task.reasoningTokens ?? 0, totalTokens: (task.inputTokens ?? 0) + (task.outputTokens ?? 0), costUsd: task.costUsd ?? 0, creditsUsed: task.creditsUsed ?? 0, creditsRemaining: task.creditsRemaining ?? null } })]);
     await client.query("UPDATE conversations SET last_message_at=NOW(),updated_at=NOW() WHERE id=$1", [task.durableConversationDbId]);
+    if (task.queueInstructionId) await client.query("UPDATE agent_instruction_queue SET status=$2,completed_at=NOW(),updated_at=NOW() WHERE public_id=$1 AND user_id=$3", [task.queueInstructionId, status === "completed" ? "completed" : "failed", task.userId]);
     await client.query("COMMIT");
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
 }
@@ -115663,7 +115670,8 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
     })).min(1).max(100),
     mode: external_exports.enum(["economy", "balanced", "high-power", "kimi", "v4pro", "grok", "grok-build", "auto"]).default("high-power"),
     conversationId: external_exports.string().optional(),
-    clientMessageId: external_exports.string().max(100).optional()
+    clientMessageId: external_exports.string().max(100).optional(),
+    attachmentIds: external_exports.array(external_exports.string().max(100)).max(8).optional()
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid input" });
@@ -115773,11 +115781,12 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
 
       // New instruction while task is running: inject into the task's queue
       // and acknowledge immediately — the loop will pick it up on its next iteration
-      _existingTask.newUserMessages.push(_incomingText);
+      const queued = await agentCollaborationRuntime?.queue?.enqueue({ serverId: s2.id, conversationId, userId: res.locals["userId"], content: _incomingText, attachmentIds: parsed.data.attachmentIds || [], activeRunId: _existingTask.runId });
+      if (!queued) _existingTask.newUserMessages.push(_incomingText);
       chatTaskEmit(_existingTask, "reply", {
-        text: "Got it. I\'ll incorporate your instruction into the current task: \"" + _incomingText.slice(0, 120) + "\""
+        text: "Queued instruction #" + (queued?.position || 1) + ": \"" + _incomingText.slice(0, 120) + "\""
       });
-      return res.json({ taskId: _existingTask.id, runId: _existingTask.runId, conversationId, intercepted: true });
+      return res.json({ taskId: _existingTask.id, runId: _existingTask.runId, conversationId, intercepted: true, queued: queued || true });
     }
   }
   // ── END CHAT CONTROLLER INTERCEPT ────────────────────────────────────────
@@ -115797,7 +115806,9 @@ router8.post("/:id/chat", requireAuth, async (req, res) => {
     lastAction: "",
     lastEmitAt: Date.now(),
     filesModified: [],
-    newUserMessages: []
+    newUserMessages: [],
+    attachmentIds: parsed.data.attachmentIds || [],
+    queueInstructionId: parsed.data.clientMessageId?.match(/^queue_([^_]+(?:-[^_]+)*)_v\d+$/)?.[1] || null
   };
   task.runId = runId;
   task.conversationId = conversationId;
@@ -116329,6 +116340,7 @@ void (async () => {
         ...parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content }))
       ];
       aiMessages.push({ role: "user", content: `[REMOTE EXECUTION CONTRACT]\nYou are already connected through the owned server record (serverId ${s2.id}) and its saved ${s2.authType ?? "key"} credential. Every action=run command executes remotely through the backend SSH connection service. Never run ssh, sshpass, scp, sftp, or construct username@host authentication commands. Supply only the command that should execute on the connected server.` });
+      if (task.attachmentContext?.length) aiMessages.push({ role: "user", content: `[ATTACHMENT REFERENCES]\nUse only attachments relevant to the active specialist. Uploading a file does not authorize execution. ZIP manifests are lazy-inspected and archive contents must not be broadly injected into context.\n${task.attachmentContext.map(file => `- ${file.public_id}: ${file.name} (${file.mime_type}, ${file.size_bytes} bytes)${file.comment ? ` — ${file.comment}` : ""}; status=${file.processing_status}; routed=${(file.metadata?.specialists || []).join(",")}${file.manifest ? `; manifest=${JSON.stringify(file.manifest).slice(0, 3000)}` : ""}${file.preview ? `; preview=${String(file.preview).slice(0, 3000)}` : ""}`).join("\n")}` });
       if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText)) aiMessages.push({ role: "user", content: `[PROFESSIONAL DEPLOYMENT CONTRACT]\nWork manifest-first and stay bounded: inspect only existing deployment manifests, package/runtime manifests, README deployment instructions, environment examples, and the actual entry point before reading source. Detect Docker/Compose before reconstructing a manual deployment. Cache the discovered stack, package manager, project root, process manager, web server, application bind and port; do not rediscover unchanged facts. Treat every project as isolated and never stop another project to obtain a preferred port.\n\nExplicitly distinguish the connected execution target (VPS, cPanel/shared hosting, or local computer) from browser verification. On a VPS, detect whether the app listens on loopback or a public interface and perform the correct origin check from the VPS. On cPanel, discover the requested domain's real document root; never assume public_html. Origin health is never final website health. The final website check uses the actual HTTPS hostname (or curl --resolve with hostname/SNI while DNS propagates), without --insecure.\n\nBefore deployment, derive expected behavior from the repository: API-only, frontend, or full-stack, plus at least one recognizable title, brand, root element, or asset. For frontend/full-stack work, inspect the public response body and separately verify referenced JavaScript/CSS/assets; JSON health at / and PM2 online do not prove a frontend deployment. Verify the API separately when present. If the public root serves an API, default page, stale app, blank shell, or broken assets instead of the expected frontend, fix routing and continue. Use a real browser when available for final render verification.\n\nComplete safe prerequisites autonomously. If DATABASE_URL is missing, inspect the actual ORM/schema/migrations, provision an isolated database and application user when safe, configure secrets without printing them, migrate, restart only the target process, and verify fresh logs and database-backed behavior. Add newly discovered requirements to the durable TODO immediately. Finish only when the requested application is accessible at its requested destination, or report the exact external blocker and preserved state.` });
       if (requestedDomain) aiMessages.push({ role: "user", content: `[DOMAIN TARGET BINDING]\nSSH execution target: ${s2.username}@${s2.host}:${s2.port}. Website target: https://${requestedDomain}${requestedWebPath}. These are different identities: the server IP can serve a default virtual host and an HTTP 403 from the raw IP does not mean the requested domain failed. The expected project root is /home/${s2.username}/${requestedDomain}; stay inside that root unless direct evidence proves a different document root. Search requested literals with grep -nF, not regex grep. Verify the hostname URL first; if DNS routing is unavailable, use curl --resolve ${requestedDomain}:443:${s2.host} https://${requestedDomain}${requestedWebPath}. A login redirect can be valid behavior. For a small source change, exact source/literal evidence plus the relevant syntax check is sufficient; a browser screenshot is optional and its absence must not force PARTIAL. Once the requested state and relevant verification pass, emit done immediately without extra discovery commands.` });
       if (simpleTaskFastPath) aiMessages.push({ role: "user", content: `[SIMPLE TASK FAST PATH]\nOriginal request (authoritative): ${userTaskText.slice(0, 1200)}\nExact target: ${explicitTargetMatch[1]}\nInspect this exact source file first. If the requested state already exists, do not edit it: run one relevant syntax check, verify the requested meaning, then finish. Otherwise make only the requested change, run one relevant syntax check, optionally perform at most one live visual check, then finish. Do not scan the project, read generated caches/vendor/node_modules, invent optional requirements, or restart planning.` });
@@ -116596,6 +116608,11 @@ Tell the user to check that the agent script is still running in their terminal 
           aiMessages.splice(1, aiMessages.length - 1, { role: "user", content: `[COMPACT RUN CONTEXT]\nOriginal request: ${originalUserMessage.slice(0, 1200)}\nCompleted commands: ${totalCommands}. Current role: ${currentRole}. Continue from the latest results below; do not repeat prior inspection.` }, ...recent);
         }
         // ── Check for new user messages injected via chat intercept ──
+        const queueReview = await agentCollaborationRuntime?.queue?.reviewSafeBoundary({ conversationId, userId: task.userId, runDbId: task.durableRunDbId, taskDbId: task.durableTaskDbId, targetContext: task.targetContext || {} }).catch(() => null);
+        for (const merged of queueReview?.merged || []) {
+          aiMessages.push({ role: "user", content: `[QUEUED USER INSTRUCTION — ${merged.decision.classification}]\n${merged.item.content}\nThis was reviewed at a safe boundary and added to the authoritative TODO. Respect constraint amendments before any conflicting future action.` });
+          if (merged.decision.classification === "INTERRUPT_CURRENT_RUN") task.orchestration.context = { ...task.orchestration.context, constraints: [...(task.orchestration.context.constraints || []), merged.item.content] };
+        }
         if (task.newUserMessages && task.newUserMessages.length > 0) {
           const _newMsg = task.newUserMessages.shift();
           const _newLc = _newMsg.toLowerCase();
@@ -125190,6 +125207,9 @@ var routes_default = router33;
 // src/app.ts
 import { installAgentRuntime, recoverStaleRuns, redactSecrets } from "./agent-runtime.mjs";
 import { installAdminRuntime, recordLoginAttempt } from "./admin-runtime.mjs";
+import { installAttachmentRuntime } from "./attachments-runtime.mjs";
+import { installInstructionQueue } from "./instruction-queue-runtime.mjs";
+var agentCollaborationRuntime;
 var app = (0, import_express34.default)();
 app.use(
   (0, import_pino_http.default)({
@@ -125215,6 +125235,9 @@ app.use(import_express34.default.json({ limit: "50mb" }));
 app.use(import_express34.default.urlencoded({ extended: true, limit: "50mb" }));
 await installAgentRuntime(app, pool);
 await installAdminRuntime(app, pool);
+const attachmentRuntime = await installAttachmentRuntime(app, pool, { authenticate: requireAuth });
+const instructionQueueRuntime = await installInstructionQueue(app, pool, { authenticate: requireAuth });
+agentCollaborationRuntime = { attachments: attachmentRuntime, queue: instructionQueueRuntime };
 app.use("/api", routes_default);
 var app_default = app;
 
