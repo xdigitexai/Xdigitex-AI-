@@ -6,7 +6,9 @@ const source = fs.readFileSync(new URL("../index.mjs", import.meta.url), "utf8")
 
 test("streaming server agent initializes one shared orchestrator context", () => {
   assert.match(source, /new OrchestratorCore\(\)/)
-  assert.match(source, /task\.orchestration = \{ orchestrator, context, selection \}/)
+  assert.match(source, /task\.orchestration = \{ orchestrator, scheduler, context, selection, specialistPlan \}/)
+  assert.match(source, /new SpecialistScheduler\(\{ maxParallel: 3, maxDepth: 2 \}\)/)
+  assert.match(source, /BASE_AGENT_POLICY/)
   assert.match(source, /renderTodoMarkdown\(context\)/)
 })
 

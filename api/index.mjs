@@ -2,7 +2,7 @@ import { createRequire as __bannerCrReq } from 'node:module';
 import __bannerPath from 'node:path';
 import __bannerUrl from 'node:url';
 import { semanticTaskKey, normalizeProjectRoot } from './agent-task-identity.mjs';
-import { OrchestratorCore, applyTodoOperations, renderTodoMarkdown } from './orchestrator/index.mjs';
+import { BASE_AGENT_POLICY, OrchestratorCore, SpecialistScheduler, applyTodoOperations, renderTodoMarkdown } from './orchestrator/index.mjs';
 import { loadRegistrySelection } from './agent-engine/v1/registry.mjs';
 import { canonicalRunResult, conciseRunTitle, deriveAcceptanceCriteria, detectRunType, isSslRequest, professionalFinalReport, requestSpecificTodo } from './run-results-runtime.mjs';
 import { compactSslResults, sslDomain, sslEvidenceFromResults, sslRecoveryFromResults } from './ssl-runtime.mjs';
@@ -112422,7 +112422,7 @@ function specialistPromptBlock(task) {
   if (!selection || !context) return "";
   const agentDocs = selection.agents.map(({ id, version, document }) => `## Specialist: ${id} v${version}\n${document}`).join("\n\n");
   const skillDocs = selection.skills.map(({ id, version, document }) => `## Skill: ${id} v${version}\n${document}`).join("\n\n");
-  return `[XDIGITEX ORCHESTRATOR WORKSPACE]\nOne user-visible run is coordinated by the orchestrator. Specialists are internal bounded roles, never separate chats. The original request and target binding are immutable. Use the authoritative TODO below, make structured handoffs when ownership changes, load no unlisted specialist or skill, and return only concise operational progress (never hidden reasoning).\n\n${renderTodoMarkdown(context)}\n\n${agentDocs}${skillDocs ? `\n\n${skillDocs}` : ""}`;
+  return `[XDIGITEX ORCHESTRATOR WORKSPACE]\n${BASE_AGENT_POLICY}\n\n${renderTodoMarkdown(context)}\n\n${agentDocs}${skillDocs ? `\n\n${skillDocs}` : ""}`;
 }
 async function refreshOrchestrationSelection(task, request, discovered = {}) {
   if (!task?.orchestration) return;
@@ -112458,7 +112458,9 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
   const todo = buildOrchestratorTodo(promptText, null, targetContext);
   const context = { ...initialized.context, todo: applyTodoOperations(initialized.context.todo, todo.map((item) => ({ type: "ADD_TASK", task: item }))) };
   const selection = loadRegistrySelection({ request: promptText, context, todo: context.todo });
-  task.orchestration = { orchestrator, context, selection };
+  const scheduler = new SpecialistScheduler({ maxParallel: 3, maxDepth: 2 });
+  const specialistPlan = scheduler.plan(context.todo.map(item => ({ id: item.key, semanticKey: item.key, owner: item.owner, status: item.status, dependencies: item.dependencies || [], resources: item.resources || [], estimatedCredits: 0 })), { availableCredits: Number(task.creditsRemaining ?? Infinity) });
+  task.orchestration = { orchestrator, scheduler, context, selection, specialistPlan };
   task.activeSpecialist = selection.agents.map((entry) => entry.id).find((id) => !["orchestrator", targetType].includes(id)) || "orchestrator";
   const client = await pool.connect();
   try {
@@ -112487,7 +112489,7 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
     const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify(task.acceptance), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true, orchestratorVersion: selection.version, runType: task.runType })]);
     task.durableTaskDbId = plan.rows[0].id;
     for (const [position, item] of taskItems.entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence) VALUES($1,$2,$3,$4,$5)", [task.durableTaskDbId, position + 1, item.title, item.status, JSON.stringify({ taskKey: item.key, owner: item.owner })]);
-    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ title: task.runTitle, runType: task.runType, acceptance: task.acceptance, workResults: [], changes: { files: [] }, orchestration: { version: selection.version, activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version }) => ({ id, version })), todo: taskItems } })]);
+    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ title: task.runTitle, runType: task.runType, acceptance: task.acceptance, workResults: [], changes: { files: [] }, orchestration: { version: selection.version, activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version, path }) => ({ id, version, path })), scheduler: { maxParallel: 3, maxDepth: 2, plan: specialistPlan.map(({ id, owner, runnable, reason, reservedCredits }) => ({ id, owner, runnable, reason, reservedCredits })) }, todo: taskItems } })]);
     await client.query("COMMIT");
     chatTaskEmit(task, "specialists_loaded", { activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })) });
     chatTaskEmit(task, "skills_loaded", { skills: selection.skills.map(({ id, version }) => ({ id, version })) });

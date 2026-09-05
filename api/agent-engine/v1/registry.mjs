@@ -17,7 +17,7 @@ const definitions = {
   testing: { file: "testing.md", skills: [] },
   debugging: { file: "debugging.md", skills: ["debugging"] },
   realtime: { file: "realtime.md", skills: ["webrtc", "socketio", "turn", "prisma"] },
-  ssl: { file: "ssl.md", skills: ["ssl"] },
+  ssl: { file: "ssl.md", skills: ["ssl", "dns"] },
   vps: { file: "adapters/vps.md", skills: ["vps", "ssh"] },
   cpanel: { file: "adapters/cpanel.md", skills: ["cpanel"] },
   local: { file: "adapters/local.md", skills: [] },
@@ -32,7 +32,12 @@ const skillFiles = {
   cpanel: "../../skills/devops/cpanel.md", website: "../../skills/verification/website.md",
   api: "../../skills/verification/api.md", pnpm: "skills/pnpm.md", npm: "skills/npm.md",
   pm2: "skills/pm2.md", systemd: "skills/systemd.md", express: "skills/express.md", webrtc: "skills/webrtc.md", socketio: "skills/socketio.md", turn: "skills/turn.md", prisma: "skills/prisma.md",
-  ssl: "skills/ssl.md",
+  ssl: "skills/ssl/SKILL.md", dns: "skills/dns/SKILL.md",
+};
+
+const skillMetadata = {
+  ssl: { description: "Issue, bind and verify hostname-valid TLS certificates", activationHints: ["ssl", "tls", "https", "certificate", "certbot", "acme"] },
+  dns: { description: "Resolve and validate domain records against an owned target", activationHints: ["dns", "domain", "a record", "aaaa", "cname"] },
 };
 
 const textOf = (input) => [input.request, input.context?.currentTask, ...(input.todo || []).map(t => `${t.key || ""} ${t.title || ""}`), ...(input.context?.findings || [])].join(" ").toLowerCase();
@@ -100,7 +105,7 @@ export function loadRegistrySelection(input = {}) {
   return {
     version: REGISTRY_VERSION,
     agents: agentIds.map(id => ({ id, version: REGISTRY_VERSION, document: fs.readFileSync(path.join(root, "specialists", definitions[id].file), "utf8") })),
-    skills: skillIds.map(id => ({ id, version: REGISTRY_VERSION, document: fs.readFileSync(path.resolve(root, skillFiles[id]), "utf8") })),
+    skills: skillIds.map(id => ({ id, version: REGISTRY_VERSION, description: skillMetadata[id]?.description || `${id} operational guidance`, activationHints: skillMetadata[id]?.activationHints || [id], path: skillFiles[id], document: fs.readFileSync(path.resolve(root, skillFiles[id]), "utf8") })),
   };
 }
 
