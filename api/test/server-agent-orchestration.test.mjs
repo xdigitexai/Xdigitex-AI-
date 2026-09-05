@@ -19,7 +19,9 @@ test("server agent applies bounded cycle and command budgets", () => {
 test("runtime failures log correlated stack details but return a safe message", () => {
   assert.match(source, /\[server-agent-runtime\]/);
   assert.match(source, /stack: err instanceof Error \? err\.stack/);
-  assert.match(source, /return "Internal agent runtime error\."/);
+  assert.match(source, /classifyStartupFailure/);
+  assert.match(source, /Run initialization failed before the first task completed/);
+  assert.match(source, /startupFailure/);
 });
 
 test("simple known-file work uses the fast path and skips generic knowledge", () => {

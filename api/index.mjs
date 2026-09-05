@@ -3,9 +3,10 @@ import __bannerPath from 'node:path';
 import __bannerUrl from 'node:url';
 import { semanticTaskKey, normalizeProjectRoot } from './agent-task-identity.mjs';
 import { BASE_AGENT_POLICY, OrchestratorCore, SpecialistScheduler, applyTodoOperations, renderTodoMarkdown } from './orchestrator/index.mjs';
-import { loadRegistrySelection } from './agent-engine/v1/registry.mjs';
+import { loadRegistrySelection, registryManifest } from './agent-engine/v1/registry.mjs';
 import { canonicalRunResult, conciseRunTitle, deriveAcceptanceCriteria, detectRunType, isSslRequest, professionalFinalReport, requestSpecificTodo } from './run-results-runtime.mjs';
 import { compactSslResults, sslDomain, sslEvidenceFromResults, sslRecoveryFromResults } from './ssl-runtime.mjs';
+import { classifyStartupFailure, createStartupTrace, validateExecutableTodo } from './run-startup-runtime.mjs';
 
 globalThis.require = __bannerCrReq(import.meta.url);
 globalThis.__filename = __bannerUrl.fileURLToPath(import.meta.url);
@@ -112439,6 +112440,8 @@ async function refreshOrchestrationSelection(task, request, discovered = {}) {
   if (task.durableRunDbId) await pool.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb,updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ orchestration: { version: selection.version, activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version }) => ({ id, version })), todo: context.todo } })]);
 }
 async function bridgeServerAgentRunStart(task, server, prompt) {
+  task.startupTrace = createStartupTrace();
+  task.startupStage = "run.create"; task.startupTrace.mark(task.startupStage);
   if (!task.userId) return;
   const promptText = String(prompt || "");
   const repository = promptText.match(/https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)/i)?.[1]?.replace(/\.git$/i, "") ?? null;
@@ -112446,20 +112449,28 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
   const targetType = server.cpanelUrl ? "cpanel" : "vps";
   const serverPublicIp = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(server.host || "")) ? server.host : null;
   const targetContext = { targetType, targetId: server.id, serverId: server.id, host: server.host, port: server.port, sshPort: server.port, username: server.username, serverPublicIp, projectName: repository?.split("/").pop() ?? null, repository, domain };
+  task.startupStage = "target.resolve"; task.startupTrace.mark(task.startupStage);
   task.targetContext = targetContext;
   task.runType = detectRunType(promptText);
   task.isSslTask = isSslRequest(promptText);
   task.sslDomain = task.isSslTask ? sslDomain(promptText) : null;
   task.acceptance = deriveAcceptanceCriteria(promptText);
+  task.startupStage = "acceptance.create"; task.startupTrace.mark(task.startupStage, { count: task.acceptance.length });
   task.acceptanceCritical = task.acceptance.length > 1;
   task.runTitle = conciseRunTitle(promptText, targetContext.projectName || server.name);
   const orchestrator = new OrchestratorCore();
   const initialized = orchestrator.initialize({ runId: task.runId, conversationId: task.conversationId, userId: String(task.userId), originalRequest: promptText, target: { type: targetType, targetId: server.id, serverId: server.id, host: server.host, sshPort: server.port, username: server.username }, project: { name: targetContext.projectName, repository }, deployment: { domain } });
   const todo = buildOrchestratorTodo(promptText, null, targetContext);
-  const context = { ...initialized.context, todo: applyTodoOperations(initialized.context.todo, todo.map((item) => ({ type: "ADD_TASK", task: item }))) };
+  const checkedTodo = validateExecutableTodo(todo, registryManifest().agents);
+  const executableTodo = checkedTodo.valid ? checkedTodo.todo : [{ key: "run.replan", title: "Regenerate executable work plan", owner: "orchestrator", status: "in_progress", dependencies: [] }];
+  task.startupStage = "todo.create"; task.startupTrace.mark(task.startupStage, { count: executableTodo.length, fallback: !checkedTodo.valid });
+  const context = { ...initialized.context, todo: applyTodoOperations(initialized.context.todo, executableTodo.map((item) => ({ type: "ADD_TASK", task: item }))) };
   const selection = loadRegistrySelection({ request: promptText, context, todo: context.todo });
+  task.startupStage = "skills.resolve"; task.startupTrace.mark(task.startupStage, { skills: selection.skills.map(item => item.id) });
+  task.startupStage = "specialists.resolve"; task.startupTrace.mark(task.startupStage, { specialists: selection.agents.map(item => item.id) });
   const scheduler = new SpecialistScheduler({ maxParallel: 3, maxDepth: 2 });
   const specialistPlan = scheduler.plan(context.todo.map(item => ({ id: item.key, semanticKey: item.key, owner: item.owner, status: item.status, dependencies: item.dependencies || [], resources: item.resources || [], estimatedCredits: 0 })), { availableCredits: Number(task.creditsRemaining ?? Infinity) });
+  task.startupStage = "scheduler.ready"; task.startupTrace.mark(task.startupStage, { runnable: specialistPlan.filter(item => item.runnable).length });
   task.orchestration = { orchestrator, scheduler, context, selection, specialistPlan };
   task.activeSpecialist = selection.agents.map((entry) => entry.id).find((id) => !["orchestrator", targetType].includes(id)) || "orchestrator";
   const client = await pool.connect();
@@ -112489,7 +112500,7 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
     const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify(task.acceptance), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true, orchestratorVersion: selection.version, runType: task.runType })]);
     task.durableTaskDbId = plan.rows[0].id;
     for (const [position, item] of taskItems.entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence) VALUES($1,$2,$3,$4,$5)", [task.durableTaskDbId, position + 1, item.title, item.status, JSON.stringify({ taskKey: item.key, owner: item.owner })]);
-    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ title: task.runTitle, runType: task.runType, acceptance: task.acceptance, workResults: [], changes: { files: [] }, orchestration: { version: selection.version, activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version, path }) => ({ id, version, path })), scheduler: { maxParallel: 3, maxDepth: 2, plan: specialistPlan.map(({ id, owner, runnable, reason, reservedCredits }) => ({ id, owner, runnable, reason, reservedCredits })) }, todo: taskItems } })]);
+    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ title: task.runTitle, runType: task.runType, acceptance: task.acceptance, startup: { stage: task.startupStage, trace: task.startupTrace.entries }, workResults: [], changes: { files: [] }, orchestration: { version: selection.version, activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version, path }) => ({ id, version, path })), scheduler: { maxParallel: 3, maxDepth: 2, plan: specialistPlan.map(({ id, owner, runnable, reason, reservedCredits }) => ({ id, owner, runnable, reason, reservedCredits })) }, todo: taskItems } })]);
     await client.query("COMMIT");
     chatTaskEmit(task, "specialists_loaded", { activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })) });
     chatTaskEmit(task, "skills_loaded", { skills: selection.skills.map(({ id, version }) => ({ id, version })) });
@@ -116317,6 +116328,7 @@ function xd_runVerificationEngine(task, n=3) {
 
 void (async () => {
     try {
+      task.startupStage = "provider.select"; task.startupTrace?.mark(task.startupStage);
       const { provider: baseProvider, model: baseModel } = modelMap[parsed.data.mode];
       const isAuto = parsed.data.mode === "auto";
       const browserStatus = await browserProbeResult;
@@ -116387,6 +116399,9 @@ void (async () => {
       const xd_compactServerPrompt = `You are XDIGITEX Server Agent connected only to ${s2.username}@${s2.host}:${s2.port}. Complete the user's read-only request autonomously. Use the minimum targeted commands and never modify files, configuration, services, SSH settings, authentication, or firewall rules. Every command must have a timeout. Do not repeat an unchanged command. Respond with exactly one JSON object per turn: {"thought":"short user-facing progress","action":"run","commands":[{"cmd":"timeout 30 <read-only command>","desc":"purpose"}]} or, only after the requested behavior is verified, {"thought":"verified","action":"done","message":"Completed.\\n\\nFindings:\\n...\\n\\nVerification:\\n..."}. A command completing is not the task completing; continue until all parts of the request are checked. Keep output concise and never expose internal notes.`;
       const xd_compactSslPrompt = `You are the XDIGITEX Infrastructure/SSL specialist connected through the owned server record. Install and verify SSL only for ${task.sslDomain}. Use a bounded sequence: compare DNS A/AAAA with the bound server; detect Nginx, Apache, LiteSpeed, OpenLiteSpeed or cPanel; identify the exact vhost/document root; inspect the existing SNI certificate; verify a temporary scoped ACME challenge; choose Certbot, webroot, AutoSSL or cPanel API from the detected environment; issue and bind the certificate; validate server configuration before a scoped reload; remove the challenge file; verify SAN, expiry, chain, normal HTTPS, correct site and renewal. A 404 is recoverable: diagnose and fix its route automatically. Never inspect application source or Git history, never touch another domain, never alter SSH/firewall, never expose private keys, never use -k/--insecure as final proof, and never ask whether to continue safe recovery. Respond with one JSON action and concise commands. Do not emit done until every acceptance criterion has evidence; otherwise report only a verified external blocker or unrecoverable failure.`;
       var xd_finalSysPrompt = task.isSslTask ? `${xd_skRes.block}\n\n${xd_compactSslPrompt}` : xd_readOnlyTask ? xd_compactServerPrompt : (xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt);
+      task.startupStage = "task.start"; task.startupTrace?.mark(task.startupStage, { taskKey: task.orchestration?.context?.todo?.find(item => item.status === "in_progress")?.key || null });
+      if (task.durableRunDbId) pool.query("UPDATE coding_agent_runs SET phase='running',metadata=metadata||$2::jsonb,updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ startup: { stage: task.startupStage, trace: task.startupTrace?.entries || [] } })]).catch(() => {});
+      chatTaskEmit(task, "task_started", { stage: task.startupStage, taskKey: task.orchestration?.context?.todo?.find(item => item.status === "in_progress")?.key || null });
       // ─────────────────────────────────────────────────────────────────────
       const aiMessages = [
         { role: "system", content: xd_finalSysPrompt },
@@ -118732,7 +118747,9 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
     } catch (err) {
       if (task.status !== "blocked" && task.status !== "cancelled") task.status = "failed";
       const rawMsg = String(err instanceof Error ? err.message : err);
-      console.error("[server-agent-runtime]", { errorName: err instanceof Error ? err.name : typeof err, message: rawMsg, stack: err instanceof Error ? err.stack : undefined, runId: task.runId, conversationId: task.conversationId });
+      const startupFailure = classifyStartupFailure(err, task.startupStage);
+      console.error("[server-agent-runtime]", { errorName: err instanceof Error ? err.name : typeof err, message: rawMsg, stack: err instanceof Error ? err.stack : undefined, runId: task.runId, conversationId: task.conversationId, serverId: s2.id, startupFailure });
+      if (task.durableRunDbId) pool.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb,error=$3,updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ startup: { stage: startupFailure.stage, trace: task.startupTrace?.entries || [], failure: startupFailure } }), startupFailure.code]).catch(() => {});
       const userMsg = (() => {
         const m2 = rawMsg.toLowerCase();
         if (m2.includes("failed to fetch") || m2.includes("fetch failed") || m2.includes("econnrefused") || m2.includes("enotfound") || m2.includes("network") || m2.includes("connection error") || m2.includes("socket")) return "\u26A0\uFE0F Unable to reach AI service \u2014 please try again in a moment.";
@@ -118740,7 +118757,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
         if (m2.includes("429") || m2.includes("rate limit") || m2.includes("quota")) return "\u26A0\uFE0F AI service is busy \u2014 please wait a moment and try again.";
         if (m2.includes("timed out") || m2.includes("timeout") || m2.includes("aborted")) return "\u26A0\uFE0F AI service timed out \u2014 the server may be under heavy load. Please try again.";
         if (m2.includes("context") && m2.includes("length")) return "\u26A0\uFE0F Request too long \u2014 please start a new conversation or shorten your message.";
-        return "Internal agent runtime error.";
+        return `Run initialization failed before the first task completed.\n\nStage: ${startupFailure.stage}\nError code: ${startupFailure.code}\nNo unbilled work was charged.`;
       })();
       send2("error", { text: userMsg });
       if (!task.lastReply) send2("reply", { text: `Failed.\n\nReason:\n${userMsg}\n\nCompleted work, if any, has been preserved.` });

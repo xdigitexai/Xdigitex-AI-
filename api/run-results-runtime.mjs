@@ -36,7 +36,16 @@ export function deriveAcceptanceCriteria(request) {
 
 export function requestSpecificTodo(request, target = {}) {
   const criteria = deriveAcceptanceCriteria(request)
-  if (isSslRequest(request)) return criteria.map((item, index) => ({ key: item.key, title: item.title, owner: item.owner, status: index === 0 ? "in_progress" : "pending", source: "ssl_acceptance" }))
+  if (isSslRequest(request)) return [
+    ["ssl.resolve_target", "Resolve domain and server binding", "ssl"],
+    ["ssl.detect_web_server", "Detect the active web server", "infrastructure"],
+    ["ssl.identify_vhost", "Identify the exact vhost and document root", "infrastructure"],
+    ["ssl.inspect_certificate", "Inspect the certificate currently served over SNI", "ssl"],
+    ["ssl.test_acme", "Test the scoped ACME challenge path", "ssl"],
+    ["ssl.issue_certificate", "Issue or repair the requested certificate", "ssl"],
+    ["ssl.bind_certificate", "Bind the certificate and validate configuration", "infrastructure"],
+    ["ssl.verify_https", "Verify public HTTPS, hostname, chain, and renewal", "testing"],
+  ].map(([key, title, owner], index) => ({ key, title, owner, status: index === 0 ? "in_progress" : "pending", dependencies: index ? [index === 1 ? "ssl.resolve_target" : ["ssl.detect_web_server", "ssl.identify_vhost", "ssl.inspect_certificate", "ssl.test_acme", "ssl.issue_certificate", "ssl.bind_certificate"][index - 2]].filter(Boolean) : [], source: "ssl_workflow" }))
   if (calling.test(String(request || ""))) return criteria.map((item, index) => ({ key: item.key, title: item.title.replace(/ verified| tested/i, match => match), owner: item.owner, status: index === 0 ? "in_progress" : "pending", source: "acceptance_criterion" }))
   return []
 }

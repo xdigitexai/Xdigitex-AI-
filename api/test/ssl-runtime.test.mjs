@@ -10,7 +10,9 @@ const request = "install ssl for ogzensmm.online"
 test("SSL tasks use goal-specific acceptance and TODO state", () => {
   const acceptance = deriveAcceptanceCriteria(request), todo = requestSpecificTodo(request)
   assert.equal(acceptance.length, 10)
-  assert.equal(todo.length, 10)
+  assert.equal(todo.length, 8)
+  assert.notDeepEqual(todo.map(item => item.key), acceptance.map(item => item.key))
+  assert.equal(todo[0].status, "in_progress")
   assert.deepEqual(acceptance.map(item => item.key), ["dns_binding", "vhost_identified", "acme_reachable", "certificate_issued", "certificate_bound", "hostname_match", "https_handshake", "no_mismatch", "public_https", "renewal"])
   assert.ok(acceptance.every(item => item.required))
 })

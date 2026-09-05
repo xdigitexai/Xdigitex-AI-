@@ -100,12 +100,15 @@ export function selectSkills(input = {}, agents = selectSpecialists(input)) {
 }
 
 export function loadRegistrySelection(input = {}) {
-  const agentIds = selectSpecialists(input);
+  const warnings = [];
+  const readOptional = (file, kind, id) => { try { return fs.readFileSync(file, "utf8") } catch (error) { warnings.push({ code: `${kind.toUpperCase()}_UNAVAILABLE`, id, message: error.code || "READ_FAILED" }); return "" } };
+  const agentIds = selectSpecialists(input).filter(id => { if (definitions[id]) return true; warnings.push({ code: "SPECIALIST_UNAVAILABLE", id }); return false });
   const skillIds = selectSkills(input, agentIds);
   return {
     version: REGISTRY_VERSION,
-    agents: agentIds.map(id => ({ id, version: REGISTRY_VERSION, document: fs.readFileSync(path.join(root, "specialists", definitions[id].file), "utf8") })),
-    skills: skillIds.map(id => ({ id, version: REGISTRY_VERSION, description: skillMetadata[id]?.description || `${id} operational guidance`, activationHints: skillMetadata[id]?.activationHints || [id], path: skillFiles[id], document: fs.readFileSync(path.resolve(root, skillFiles[id]), "utf8") })),
+    agents: agentIds.map(id => ({ id, version: REGISTRY_VERSION, document: readOptional(path.join(root, "specialists", definitions[id].file), "specialist", id) })).filter(item => item.document),
+    skills: skillIds.filter(id => { if (skillFiles[id]) return true; warnings.push({ code: "SKILL_UNAVAILABLE", id }); return false }).map(id => ({ id, version: REGISTRY_VERSION, description: skillMetadata[id]?.description || `${id} operational guidance`, activationHints: skillMetadata[id]?.activationHints || [id], path: skillFiles[id], document: readOptional(path.resolve(root, skillFiles[id]), "skill", id) })).filter(item => item.document),
+    warnings,
   };
 }
 
