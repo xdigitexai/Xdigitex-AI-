@@ -2,6 +2,8 @@ import { createRequire as __bannerCrReq } from 'node:module';
 import __bannerPath from 'node:path';
 import __bannerUrl from 'node:url';
 import { semanticTaskKey, normalizeProjectRoot } from './agent-task-identity.mjs';
+import { OrchestratorCore, applyTodoOperations, renderTodoMarkdown } from './orchestrator/index.mjs';
+import { loadRegistrySelection } from './agent-engine/v1/registry.mjs';
 
 globalThis.require = __bannerCrReq(import.meta.url);
 globalThis.__filename = __bannerUrl.fileURLToPath(import.meta.url);
@@ -112398,6 +112400,39 @@ async function rememberAgentFact({ userId, scopeType, scopeId, key, value, sourc
   if (/(password|private.?key|api.?key|secret|bearer|credit.?card)/i.test(`${key} ${serialized}`)) return;
   await pool.query(`INSERT INTO agent_scoped_memory(user_id,scope_type,scope_id,key,value,source,confidence,last_verified_at) VALUES($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT(user_id,scope_type,scope_id,key) DO UPDATE SET value=EXCLUDED.value,source=EXCLUDED.source,confidence=EXCLUDED.confidence,last_verified_at=NOW(),updated_at=NOW()`, [userId, scopeType, String(scopeId), key, serialized, source, confidence]);
 }
+function buildOrchestratorTodo(prompt, selection, targetContext) {
+  const deploy = /\bdeploy|deployment|publish|production|nginx|domain|ssl\b/i.test(String(prompt));
+  const titles = deploy
+    ? ["Inspect target and deployment state", "Inspect repository and runtime", "Implement or configure the requested application", "Build and start only the target application", "Configure the requested domain and TLS", "Verify origin, public application, assets, and required APIs"]
+    : ["Inspect the bound target", "Perform the requested work", "Verify the requested outcome", "Deliver the factual final report"];
+  return titles.map((title, position) => {
+    const picked = loadRegistrySelection({ request: `${prompt} ${title}`, context: { target: { type: targetContext.targetType }, project: targetContext } });
+    const owner = picked.agents.map((agent) => agent.id).find((id) => !["orchestrator", targetContext.targetType].includes(id)) || "orchestrator";
+    return { key: semanticTaskKey(title, targetContext), title, owner, status: position === 0 ? "in_progress" : "pending" };
+  });
+}
+function specialistPromptBlock(task) {
+  const selection = task.orchestration?.selection;
+  const context = task.orchestration?.context;
+  if (!selection || !context) return "";
+  const agentDocs = selection.agents.map(({ id, version, document }) => `## Specialist: ${id} v${version}\n${document}`).join("\n\n");
+  const skillDocs = selection.skills.map(({ id, version, document }) => `## Skill: ${id} v${version}\n${document}`).join("\n\n");
+  return `[XDIGITEX ORCHESTRATOR WORKSPACE]\nOne user-visible run is coordinated by the orchestrator. Specialists are internal bounded roles, never separate chats. The original request and target binding are immutable. Use the authoritative TODO below, make structured handoffs when ownership changes, load no unlisted specialist or skill, and return only concise operational progress (never hidden reasoning).\n\n${renderTodoMarkdown(context)}\n\n${agentDocs}${skillDocs ? `\n\n${skillDocs}` : ""}`;
+}
+async function refreshOrchestrationSelection(task, request, discovered = {}) {
+  if (!task?.orchestration) return;
+  const project = { ...(task.orchestration.context.project || {}), ...(task.targetContext || {}), ...discovered };
+  const context = { ...task.orchestration.context, project };
+  const selection = loadRegistrySelection({ request, context, todo: context.todo });
+  const beforeAgents = (task.orchestration.selection?.agents || []).map((entry) => entry.id).join(",");
+  const beforeSkills = (task.orchestration.selection?.skills || []).map((entry) => entry.id).join(",");
+  task.orchestration = { ...task.orchestration, context, selection };
+  const activeSpecialist = selection.agents.map((entry) => entry.id).find((id) => !["orchestrator", context.target?.type].includes(id)) || "orchestrator";
+  task.activeSpecialist = activeSpecialist;
+  if (beforeAgents !== selection.agents.map((entry) => entry.id).join(",")) chatTaskEmit(task, "specialists_loaded", { activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })) });
+  if (beforeSkills !== selection.skills.map((entry) => entry.id).join(",")) chatTaskEmit(task, "skills_loaded", { skills: selection.skills.map(({ id, version }) => ({ id, version })) });
+  if (task.durableRunDbId) await pool.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb,updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ orchestration: { version: selection.version, activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version }) => ({ id, version })), todo: context.todo } })]);
+}
 async function bridgeServerAgentRunStart(task, server, prompt) {
   if (!task.userId) return;
   const promptText = String(prompt || "");
@@ -112407,6 +112442,13 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
   const serverPublicIp = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(server.host || "")) ? server.host : null;
   const targetContext = { targetType, targetId: server.id, serverId: server.id, host: server.host, port: server.port, sshPort: server.port, username: server.username, serverPublicIp, projectName: repository?.split("/").pop() ?? null, repository, domain };
   task.targetContext = targetContext;
+  const orchestrator = new OrchestratorCore();
+  const initialized = orchestrator.initialize({ runId: task.runId, conversationId: task.conversationId, userId: String(task.userId), originalRequest: promptText, target: { type: targetType, targetId: server.id, serverId: server.id, host: server.host, sshPort: server.port, username: server.username }, project: { name: targetContext.projectName, repository }, deployment: { domain } });
+  const todo = buildOrchestratorTodo(promptText, null, targetContext);
+  const context = { ...initialized.context, todo: applyTodoOperations(initialized.context.todo, todo.map((item) => ({ type: "ADD_TASK", task: item }))) };
+  const selection = loadRegistrySelection({ request: promptText, context, todo: context.todo });
+  task.orchestration = { orchestrator, context, selection };
+  task.activeSpecialist = selection.agents.map((entry) => entry.id).find((id) => !["orchestrator", targetType].includes(id)) || "orchestrator";
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -112424,11 +112466,14 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
     const run = await client.query(`INSERT INTO coding_agent_runs(public_id,conversation_id,user_id,status,phase,heartbeat_at,started_at,metadata) VALUES($1,$2,$3,'running','planning',NOW(),NOW(),$4) ON CONFLICT(public_id) DO UPDATE SET heartbeat_at=NOW(),updated_at=NOW() RETURNING id`, [task.runId, conversationDbId, task.userId, JSON.stringify({ source: "server-agent", legacyTaskId: task.id, sourceMessageId: message.rows[0].id, triggerMessageId: message.rows[0].id, originalRequest: promptText, serverId: server.id, serverName: server.name, host: server.host, port: server.port, username: server.username, targetContext })]);
     task.durableRunDbId = run.rows[0].id; task.durableConversationDbId = conversationDbId;
     await client.query("UPDATE conversation_messages SET run_id=$2 WHERE id=$1", [message.rows[0].id, task.durableRunDbId]);
-    const taskItems = /\bdeploy|deployment|nginx|domain|ssl\b/i.test(String(prompt)) ? ["Connect to server", "Inspect current deployment", "Inspect repository and runtime", "Install, build, and start application", "Configure domain and TLS", "Verify production"] : ["Inspect server state", "Perform requested work", "Verify result", "Deliver final report"];
-    const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify(taskItems.map((title) => ({ title, required: true }))), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true })]);
+    const taskItems = context.todo;
+    const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify(taskItems.map(({ title, owner }) => ({ title, owner, required: true }))), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true, orchestratorVersion: selection.version })]);
     task.durableTaskDbId = plan.rows[0].id;
-    for (const [position, title] of taskItems.entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status) VALUES($1,$2,$3,$4)", [task.durableTaskDbId, position + 1, title, position === 0 ? "in_progress" : "pending"]);
+    for (const [position, item] of taskItems.entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence) VALUES($1,$2,$3,$4,$5)", [task.durableTaskDbId, position + 1, item.title, item.status, JSON.stringify({ taskKey: item.key, owner: item.owner })]);
+    await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ orchestration: { version: selection.version, activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version }) => ({ id, version })), todo: taskItems } })]);
     await client.query("COMMIT");
+    chatTaskEmit(task, "specialists_loaded", { activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })) });
+    chatTaskEmit(task, "skills_loaded", { skills: selection.skills.map(({ id, version }) => ({ id, version })) });
     await Promise.all([
       rememberAgentFact({ userId: task.userId, scopeType: "user", scopeId: task.userId, key: "operating_preferences", value: { preferFreePorts: true, preserveSshConfiguration: true, restartOnlyTargetProcess: true, verifyBeforeCompletion: true, exactDomainIsolation: true, targetedFileReading: true }, source: "system_policy", confidence: 1 }),
       rememberAgentFact({ userId: task.userId, scopeType: "server", scopeId: server.id, key: "identity", value: { serverId: server.id, name: server.name, host: server.host, port: server.port, username: server.username, credentialRef: `server_${server.id}` }, source: "connected_server_record", confidence: 1 })
@@ -112557,6 +112602,7 @@ async function reconcileRunDiscoveries(task, output) {
     task.targetContext = { ...(task.targetContext || {}), ...discovered };
     await pool.query("UPDATE coding_agent_runs SET metadata=jsonb_set(metadata,'{targetContext}',COALESCE(metadata->'targetContext','{}'::jsonb)||$2::jsonb,true),updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify(discovered)]);
     chatTaskEmit(task, "target_context", discovered);
+    await refreshOrchestrationSelection(task, task.orchestration?.context?.identity?.originalRequest || "", discovered).catch(() => {});
   }
   if (/DATABASE_URL.{0,80}(?:must be set|missing|required)|did you forget to provision a database/i.test(text)) {
     await addRunTasks(task, ["Inspect database requirements", "Provision isolated application database", "Configure application DATABASE_URL", "Run production-safe database migrations", "Restart application with database configuration", "Verify database-backed application health"], "Application database requirement detected");
@@ -116249,8 +116295,12 @@ void (async () => {
       if (detectedTech.length > 0 && knowledgeBlock) {
         send2("think", { text: `\u{1F4DA} Knowledge Base: loaded proven fixes for ${detectedTech.join(", ")}` });
       }
-      // ── Skill Engine call ─────────────────────────────────────────────────────
-      var xd_skRes = xd_runSkillEngine(userTaskText, 5);
+      // Load only the versioned specialists and stack skills selected for this run.
+      await refreshOrchestrationSelection(task, userTaskText).catch(() => {});
+      var xd_skRes = {
+        matches: (task.orchestration?.selection?.skills || []).map((entry) => ({ skill: { meta: { name: entry.id }, file: `agent-engine/v1:${entry.version}` }, confidence: 1, matchedKeywords: [] })),
+        block: specialistPromptBlock(task)
+      };
       if (xd_skRes.matches.length > 0) {
         send2("skills_loaded", { skills: xd_skRes.matches.map(function(m) { return { name: m.skill.meta.name, file: m.skill.file, confidence: m.confidence, keywords: m.matchedKeywords }; }) });
       // ── Verification Engine ───────────────────────────────────────────────

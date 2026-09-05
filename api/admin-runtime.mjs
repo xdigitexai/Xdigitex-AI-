@@ -4,6 +4,37 @@ const ADMIN_ROLES = new Set(["super_admin", "admin", "moderator", "support"]);
 const ipOf = req => String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim().slice(0, 64);
 const tokenUserId = req => Number(String(req.headers.authorization || "").match(/^Bearer mock-token-(\d+)$/)?.[1] || 0);
 
+// Build a public execution summary from durable run metadata/events. This is
+// intentionally operational telemetry only: prompts and model reasoning are
+// never returned to the admin console.
+export function summarizeSpecialistActivity(metadata = {}, events = [], tools = []) {
+  const safeName = value => String(value || "").trim().slice(0, 80);
+  const specialists = new Map();
+  const ensure = name => { const key=safeName(name)||"orchestrator"; if(!specialists.has(key)) specialists.set(key,{name:key,tokens:0,duration_ms:0,actions:0,retries:0,tasks:0}); return specialists.get(key); };
+  const declared = Array.isArray(metadata.specialists) ? metadata.specialists : [];
+  for (const item of declared) { const source=typeof item==="string"?{name:item}:item||{}; Object.assign(ensure(source.name||source.id||source.role),{tokens:Number(source.tokens||0),duration_ms:Number(source.duration_ms||source.durationMs||0),actions:Number(source.actions||0),retries:Number(source.retries||0),tasks:Number(source.tasks||0)}); }
+  const skills = new Map(), handoffs=[];
+  let active=safeName(metadata.activeSpecialist||metadata.currentSpecialist||metadata.active_specialist);
+  for (const event of events) {
+    const p=event.payload||{}, type=String(event.type||"");
+    const name=safeName(p.specialist||p.agent||p.owner||p.role||p.toSpecialist||p.to);
+    if (name) {
+      const s=ensure(name); s.tokens+=Number(p.tokens||p.tokenCount||0); s.duration_ms+=Number(p.duration_ms||p.durationMs||0);
+      if (/tool|action|command/.test(type)) s.actions+=1;
+      if (/retry/.test(type)) s.retries+=1;
+      if (/task\.(?:assigned|started|completed)/.test(type)) s.tasks+=1;
+      if (/(?:specialist|agent)\.(?:started|active|selected)|task\.assigned/.test(type)) active=name;
+    }
+    if (/handoff|delegat/.test(type)) { const to=safeName(p.toSpecialist||p.to||p.specialist); handoffs.push({from:safeName(p.fromSpecialist||p.from||p.previous),to,at:event.created_at,reason:safeName(p.reason||p.summary)}); if(to) active=to; }
+    const loaded=p.skills||p.loadedSkills||(p.skill?[p.skill]:[]);
+    for (const skill of Array.isArray(loaded)?loaded:[]) { const x=typeof skill==="string"?{name:skill}:skill||{}, n=safeName(x.name||x.id); if(n) skills.set(n,{name:n,version:safeName(x.version)||null}); }
+  }
+  for (const tool of tools) { const name=safeName(tool.specialist||tool.owner||tool.input?.specialist); const s=ensure(name||"orchestrator"); s.actions+=1; s.duration_ms+=Number(tool.duration_ms||0); if(tool.status==="failed") s.retries+=Number(tool.input?.retry||0); }
+  const metadataSkills=metadata.skillsLoaded||metadata.loadedSkills||[];
+  for(const skill of Array.isArray(metadataSkills)?metadataSkills:[]){const x=typeof skill==="string"?{name:skill}:skill||{},n=safeName(x.name||x.id);if(n)skills.set(n,{name:n,version:safeName(x.version)||null});}
+  return {active_specialist:active||null,specialists:[...specialists.values()],handoffs:handoffs.slice(-50),skills:[...skills.values()]};
+}
+
 export async function ensureAdminSchema(pool) {
   for (const sql of [
     `CREATE TABLE IF NOT EXISTS admin_login_events(id BIGSERIAL PRIMARY KEY,user_id INTEGER REFERENCES users(id),identifier TEXT,ip TEXT NOT NULL,user_agent TEXT,success BOOLEAN NOT NULL,failure_category TEXT,session_ref TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
@@ -113,7 +144,7 @@ export async function installAdminRuntime(app, pool) {
     } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); }
   });
   app.post(`${route}/users/:id/warnings`, auth, async (req,res)=>{const title=String(req.body.title||"").trim(),message=String(req.body.message||"").trim(),severity=String(req.body.severity||"warning");if(!title||!message||!["info","warning","critical"].includes(severity))return res.status(400).json({error:"Title, message, and valid severity are required"});const q=await pool.query(`INSERT INTO account_warnings(user_id,title,message,severity,created_by) VALUES($1,$2,$3,$4,$5) RETURNING *`,[Number(req.params.id),title,message,severity,req.adminUser.id]);await audit(req,"USER_WARNING_SENT","user",req.params.id,{title,severity});res.status(201).json(q.rows[0]);});
-  app.get(`${route}/runs`, auth, async (req, res) => { const limit=Math.max(1,Math.min(100,Number(req.query.limit)||50)); const q=await pool.query(`SELECT r.public_id run_id,r.status,r.phase,r.started_at,r.completed_at,r.error,r.metadata,u.id user_id,u.email,c.public_id conversation_id,s.name server_name FROM coding_agent_runs r JOIN users u ON u.id=r.user_id LEFT JOIN conversations c ON c.id=r.conversation_id LEFT JOIN servers s ON s.id=c.server_id ORDER BY r.started_at DESC LIMIT $1`,[limit]); res.json({items:q.rows}); });
+  app.get(`${route}/runs`, auth, async (req, res) => { const limit=Math.max(1,Math.min(100,Number(req.query.limit)||50)); const q=await pool.query(`SELECT r.id,r.public_id run_id,r.status,r.phase,r.started_at,r.completed_at,r.error,r.metadata,u.id user_id,u.email,c.public_id conversation_id,s.name server_name FROM coding_agent_runs r JOIN users u ON u.id=r.user_id LEFT JOIN conversations c ON c.id=r.conversation_id LEFT JOIN servers s ON s.id=c.server_id ORDER BY r.started_at DESC LIMIT $1`,[limit]); const ids=q.rows.map(x=>x.id); let events=[],tools=[]; if(ids.length){[events,tools]=await Promise.all([pool.query(`SELECT run_id,sequence,type,payload,created_at FROM agent_run_events WHERE run_id=ANY($1::bigint[]) ORDER BY run_id,sequence`,[ids]),pool.query(`SELECT run_id,name,status,input,duration_ms FROM agent_tool_calls WHERE run_id=ANY($1::bigint[]) ORDER BY run_id,id`,[ids])]);} const items=q.rows.map(({id,...run})=>({...run,observability:summarizeSpecialistActivity(run.metadata,events.rows?.filter(x=>Number(x.run_id)===Number(id))||[],tools.rows?.filter(x=>Number(x.run_id)===Number(id))||[])})); res.json({items}); });
   app.get(`${route}/audit`, auth, async (req,res)=>{const limit=Math.max(1,Math.min(100,Number(req.query.limit)||50));const q=await pool.query(`SELECT a.*,u.email actor_email FROM admin_action_audit a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.created_at DESC LIMIT $1`,[limit]);res.json({items:q.rows});});
   app.get(`${route}/security`, auth, async (_req,res)=>{const [logins,blocks]=await Promise.all([pool.query(`SELECT * FROM admin_login_events ORDER BY created_at DESC LIMIT 100`),pool.query(`SELECT b.*,u.email created_by_email FROM admin_ip_blocks b LEFT JOIN users u ON u.id=b.created_by ORDER BY b.created_at DESC LIMIT 100`)]);res.json({loginEvents:logins.rows,blockedIps:blocks.rows});});
   app.post(`${route}/ip-blocks`, auth, async (req,res)=>{const ip=String(req.body.ip||"").trim(),reason=String(req.body.reason||"").trim(),notes=String(req.body.notes||"").trim(),expiresAt=req.body.expiresAt||null;if(!ip||!reason||ip===ipOf(req))return res.status(400).json({error:"IP and reason are required; current admin IP cannot be blocked"});const q=await pool.query(`INSERT INTO admin_ip_blocks(ip,reason,notes,expires_at,created_by) VALUES($1,$2,$3,$4,$5) ON CONFLICT(ip) DO UPDATE SET reason=$2,notes=$3,expires_at=$4,active=TRUE,updated_at=NOW() RETURNING *`,[ip,reason,notes,expiresAt,req.adminUser.id]);await audit(req,"ADMIN_IP_BLOCKED","ip",ip,{reason,expiresAt});res.status(201).json(q.rows[0]);});
