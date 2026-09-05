@@ -6,8 +6,9 @@ import { BASE_AGENT_POLICY, OrchestratorCore, SpecialistScheduler, applyTodoOper
 import { loadRegistrySelection, registryManifest } from './agent-engine/v1/registry.mjs';
 import { canonicalRunResult, conciseRunTitle, deriveAcceptanceCriteria, detectRunType, isSslRequest, professionalFinalReport, requestSpecificTodo } from './run-results-runtime.mjs';
 import { compactSslResults, sslDomain, sslEvidenceFromResults, sslRecoveryFromResults } from './ssl-runtime.mjs';
-import { classifyStartupFailure, createStartupTrace, validateExecutableTodo } from './run-startup-runtime.mjs';
-import { EXECUTION_TOOL, normalizeModelTurn, partiallyVerifiedAllowed, validateRemoteToolCall } from './agent-tool-protocol.mjs';
+import { createStartupTrace, validateExecutableTodo } from './run-startup-runtime.mjs';
+import { EXECUTION_TOOL, HOSTING_DETECTION_TOOL, normalizeModelTurn, partiallyVerifiedAllowed, validateRemoteToolCall } from './agent-tool-protocol.mjs';
+import { classifyTaskRuntimeFailure, reconcileRun, startOrResumeTask } from './run-task-state.mjs';
 
 globalThis.require = __bannerCrReq(import.meta.url);
 globalThis.__filename = __bannerUrl.fileURLToPath(import.meta.url);
@@ -112308,6 +112309,12 @@ pool.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT`).ca
 pool.query(`ALTER TABLE conversation_messages ADD COLUMN IF NOT EXISTS client_message_id TEXT`).catch(()=>{});
 pool.query(`ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS task_id BIGINT REFERENCES agent_tasks(id) ON DELETE SET NULL`).catch(()=>{});
 pool.query(`ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'native'`).catch(()=>{});
+pool.query(`ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS provider_call_id TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS task_item_id BIGINT REFERENCES agent_task_items(id) ON DELETE SET NULL`).catch(()=>{});
+pool.query(`ALTER TABLE agent_task_items ADD COLUMN IF NOT EXISTS semantic_key TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE agent_task_items ADD COLUMN IF NOT EXISTS owner TEXT`).catch(()=>{});
+pool.query(`ALTER TABLE agent_task_items ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ`).catch(()=>{});
+pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS agent_task_items_semantic_unique ON agent_task_items(task_id,semantic_key) WHERE semantic_key IS NOT NULL`).catch(()=>{});
 pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_client_unique ON conversation_messages(conversation_id,client_message_id) WHERE client_message_id IS NOT NULL`).catch(()=>{});
 pool.query(`CREATE TABLE IF NOT EXISTS agent_message_idempotency (conversation_id TEXT NOT NULL,user_id INTEGER NOT NULL,server_id INTEGER NOT NULL,client_message_id TEXT NOT NULL,run_id TEXT,task_id TEXT,created_at TIMESTAMP DEFAULT NOW(),PRIMARY KEY(conversation_id,client_message_id))`).catch(()=>{});
 pool.query(`CREATE INDEX IF NOT EXISTS conversations_server_last_idx ON conversations(server_id,last_message_at DESC)`).catch(()=>{});
@@ -112457,6 +112464,7 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
   task.runType = detectRunType(promptText);
   task.isSslTask = isSslRequest(promptText);
   task.sslDomain = task.isSslTask ? sslDomain(promptText) : null;
+  if (task.isSslTask) Object.assign(targetContext, { projectName: null, projectRoot: null, accountHome: server.username === "root" ? "/root" : `/home/${server.username}`, domain: task.sslDomain, documentRoot: null, hostingType: "unknown" });
   task.acceptance = deriveAcceptanceCriteria(promptText);
   task.startupStage = "acceptance.create"; task.startupTrace.mark(task.startupStage, { count: task.acceptance.length });
   task.acceptanceCritical = task.acceptance.length > 1;
@@ -112502,7 +112510,7 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
     const taskItems = context.todo;
     const plan = await client.query(`INSERT INTO agent_tasks(public_id,conversation_id,run_id,goal,status,acceptance_criteria,metadata) VALUES($1,$2,$3,$4,'in_progress',$5,$6) RETURNING id`, [randomUUID2(), conversationDbId, task.durableRunDbId, prompt, JSON.stringify(task.acceptance), JSON.stringify({ authoritative: true, builderQueueIsSubordinate: true, orchestratorVersion: selection.version, runType: task.runType })]);
     task.durableTaskDbId = plan.rows[0].id;
-    for (const [position, item] of taskItems.entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence) VALUES($1,$2,$3,$4,$5)", [task.durableTaskDbId, position + 1, item.title, item.status, JSON.stringify({ taskKey: item.key, owner: item.owner })]);
+    for (const [position, item] of taskItems.entries()) await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence,semantic_key,owner,started_at) VALUES($1,$2,$3,$4,$5,$6,$7,CASE WHEN $4='in_progress' THEN NOW() END)", [task.durableTaskDbId, position + 1, item.title, item.status === "in_progress" ? "running" : item.status, JSON.stringify({ taskKey: item.key, owner: item.owner }), item.key, item.owner]);
     await client.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb WHERE id=$1", [task.durableRunDbId, JSON.stringify({ title: task.runTitle, runType: task.runType, acceptance: task.acceptance, startup: { stage: task.startupStage, trace: task.startupTrace.entries }, workResults: [], changes: { files: [] }, orchestration: { version: selection.version, activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })), skills: selection.skills.map(({ id, version, path }) => ({ id, version, path })), scheduler: { maxParallel: 3, maxDepth: 2, plan: specialistPlan.map(({ id, owner, runnable, reason, reservedCredits }) => ({ id, owner, runnable, reason, reservedCredits })) }, todo: taskItems } })]);
     await client.query("COMMIT");
     chatTaskEmit(task, "specialists_loaded", { activeSpecialist: task.activeSpecialist, specialists: selection.agents.map(({ id, version }) => ({ id, version })) });
@@ -112531,7 +112539,7 @@ async function bridgeServerAgentRunFinish(task) {
   try { await client.query("BEGIN");
     await client.query("UPDATE coding_agent_runs SET status=$2,phase=$2,heartbeat_at=NOW(),completed_at=NOW(),lock_token=NULL,updated_at=NOW(),error=CASE WHEN $2='failed' THEN $3 ELSE error END WHERE id=$1", [task.durableRunDbId, status, failed ? finalText : null]);
     await client.query("UPDATE agent_tasks SET status=$2,updated_at=NOW() WHERE id=$1", [task.durableTaskDbId, status]);
-    await client.query("UPDATE agent_task_items SET status=CASE WHEN $2='completed' AND $4=false THEN 'completed' WHEN status='in_progress' AND $2<>'completed' THEN 'not_tested' ELSE status END,evidence=CASE WHEN $2='completed' AND $4=false THEN $3 ELSE evidence END,updated_at=NOW() WHERE task_id=$1", [task.durableTaskDbId, status, JSON.stringify({ finalResponseStored: true, filesModified: task.filesModified ?? [] }), Boolean(task.acceptanceCritical)]);
+    await client.query("UPDATE agent_task_items SET status=CASE WHEN $2='completed' AND $4=false THEN 'completed' WHEN status IN ('in_progress','running') AND $2<>'completed' THEN 'not_tested' ELSE status END,evidence=CASE WHEN $2='completed' AND $4=false THEN $3 ELSE evidence END,updated_at=NOW() WHERE task_id=$1", [task.durableTaskDbId, status, JSON.stringify({ finalResponseStored: true, filesModified: task.filesModified ?? [] }), Boolean(task.acceptanceCritical)]);
     await client.query("SELECT pg_advisory_xact_lock($1)", [task.durableConversationDbId]);
     const sequence = (await client.query("SELECT COALESCE(MAX(sequence),0)+1 n FROM conversation_messages WHERE conversation_id=$1", [task.durableConversationDbId])).rows[0].n;
     const resultMetadata = { ...task.canonicalResult, status: canonical.status, acceptance };
@@ -112548,7 +112556,7 @@ async function completeRunTask(task, evidence) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const current = await client.query("SELECT id,position,title FROM agent_task_items WHERE task_id=$1 AND status='in_progress' ORDER BY position LIMIT 1 FOR UPDATE", [task.durableTaskDbId]);
+    const current = await client.query("SELECT id,position,title FROM agent_task_items WHERE task_id=$1 AND status IN ('in_progress','running') ORDER BY position LIMIT 1 FOR UPDATE", [task.durableTaskDbId]);
     if (!current.rowCount) { await client.query("COMMIT"); return; }
     const item = current.rows[0];
     const requiresBehavioralProof = /\b(test|verify|audio|video|incoming call|call history|turn relay|mobile call|production call quality)\b/i.test(item.title);
@@ -112564,7 +112572,7 @@ async function completeRunTask(task, evidence) {
       task.acceptance[item.position - 1] = { ...task.acceptance[item.position - 1], status: "passed", evidence: [JSON.stringify(evidence ?? {})] };
       await client.query("UPDATE coding_agent_runs SET metadata=jsonb_set(metadata,'{acceptance}',$2::jsonb,true),updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify(task.acceptance)]);
     }
-    const next = await client.query("UPDATE agent_task_items SET status='in_progress',updated_at=NOW() WHERE id=(SELECT id FROM agent_task_items WHERE task_id=$1 AND status='pending' ORDER BY position LIMIT 1) RETURNING title,position", [task.durableTaskDbId]);
+    const next = await client.query("UPDATE agent_task_items SET status='running',started_at=COALESCE(started_at,NOW()),updated_at=NOW() WHERE id=(SELECT id FROM agent_task_items WHERE task_id=$1 AND status='pending' ORDER BY position LIMIT 1) RETURNING id,title,position,semantic_key,owner", [task.durableTaskDbId]);
     if (next.rowCount && memoryTodo?.[next.rows[0].position - 1]) memoryTodo[next.rows[0].position - 1] = { ...memoryTodo[next.rows[0].position - 1], status: "in_progress" };
     await client.query("UPDATE agent_runs SET heartbeat_at=NOW(),current_step=$2 WHERE run_id=$1", [task.runId, next.rows[0]?.title ?? "Finalizing response"]);
     await client.query("COMMIT");
@@ -112584,7 +112592,9 @@ async function applySslRunEvidence(task, results) {
     if (criterion) Object.assign(criterion, finding);
     const memoryItem = task.orchestration?.context?.todo?.find(item => item.key === finding.key);
     if (memoryItem) Object.assign(memoryItem, { status: "completed", evidence: finding.evidence });
-    await pool.query("UPDATE agent_task_items SET status='completed',evidence=evidence||$3::jsonb,updated_at=NOW() WHERE task_id=$1 AND evidence->>'taskKey'=$2", [task.durableTaskDbId, finding.key, JSON.stringify({ verificationResult: "passed", evidence: finding.evidence })]);
+    const taskKeyByAcceptance = { dns_binding: "ssl_resolve_target", vhost_identified: "ssl_identify_vhost", acme_reachable: "ssl_test_acme", certificate_issued: "ssl_issue_certificate", certificate_bound: "ssl_bind_certificate", hostname_match: "ssl_verify_https", https_handshake: "ssl_verify_https", no_mismatch: "ssl_verify_https", public_https: "ssl_verify_https", renewal: "ssl_verify_https" };
+    const executableKey = taskKeyByAcceptance[finding.key];
+    if (executableKey) await pool.query("UPDATE agent_task_items SET status='completed',evidence=evidence||$3::jsonb,updated_at=NOW() WHERE task_id=$1 AND semantic_key=$2", [task.durableTaskDbId, executableKey, JSON.stringify({ verificationResult: "passed", acceptanceKey: finding.key, evidence: finding.evidence })]);
     chatTaskEmit(task, "verification_result", finding);
   }
   if (recovery.tasks.length) {
@@ -112593,8 +112603,13 @@ async function applySslRunEvidence(task, results) {
     if (previousHash !== recovery.stateHash) await addRunTasks(task, recovery.tasks, "ssl_recovery");
     chatTaskEmit(task, "ssl_recovery", { domain: task.sslDomain, recoverable: true, summary: recovery.summary, tasks: recovery.tasks });
   }
-  await pool.query("UPDATE agent_task_items SET status='pending',updated_at=NOW() WHERE task_id=$1 AND status='in_progress'", [task.durableTaskDbId]);
-  const next = await pool.query("UPDATE agent_task_items SET status='in_progress',updated_at=NOW() WHERE id=(SELECT id FROM agent_task_items WHERE task_id=$1 AND status='pending' ORDER BY position LIMIT 1) RETURNING title,position", [task.durableTaskDbId]);
+  await pool.query("UPDATE agent_task_items SET status='pending',updated_at=NOW() WHERE task_id=$1 AND status IN ('in_progress','running')", [task.durableTaskDbId]);
+  const next = await pool.query("UPDATE agent_task_items SET status='running',started_at=COALESCE(started_at,NOW()),updated_at=NOW() WHERE id=(SELECT id FROM agent_task_items WHERE task_id=$1 AND status='pending' ORDER BY position LIMIT 1) RETURNING id,title,position,semantic_key,owner", [task.durableTaskDbId]);
+  if (next.rowCount) {
+    task.activeTask = next.rows[0];
+    await pool.query("UPDATE coding_agent_runs SET metadata=jsonb_set(jsonb_set(metadata,'{currentTaskId}',to_jsonb($2::text),true),'{currentTaskSemanticKey}',to_jsonb($3::text),true),phase='running',updated_at=NOW() WHERE id=$1", [task.durableRunDbId, String(next.rows[0].id), next.rows[0].semantic_key]);
+    chatTaskEmit(task, "task_start", { task: next.rows[0].title, taskId: next.rows[0].id, taskSemanticKey: next.rows[0].semantic_key, owner: next.rows[0].owner, position: next.rows[0].position });
+  }
   const memoryTodo = task.orchestration?.context?.todo;
   if (next.rowCount && memoryTodo?.[next.rows[0].position - 1]) memoryTodo[next.rows[0].position - 1].status = "in_progress";
   await pool.query("UPDATE coding_agent_runs SET metadata=jsonb_set(metadata,'{acceptance}',$2::jsonb,true),updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify(task.acceptance)]);
@@ -112621,7 +112636,7 @@ async function addRunTasks(task, titles, reason) {
       const key = semanticTaskKey(title, task?.targetContext);
       if (keys.has(key)) continue;
       position++;
-      await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence) VALUES($1,$2,$3,'pending',$4)", [task.durableTaskDbId, position, title, JSON.stringify({ discovered: true, reason, taskKey: key, attemptCount: 0 })]);
+      await client.query("INSERT INTO agent_task_items(task_id,position,title,status,evidence,semantic_key,owner) VALUES($1,$2,$3,'pending',$4,$5,$6) ON CONFLICT(task_id,semantic_key) WHERE semantic_key IS NOT NULL DO NOTHING", [task.durableTaskDbId, position, title, JSON.stringify({ discovered: true, reason, taskKey: key, attemptCount: 0 }), key, task.activeSpecialist || "orchestrator"]);
       keys.add(key); added.push({ title, position, status: "pending" });
     }
     await client.query("COMMIT");
@@ -112638,7 +112653,7 @@ async function reconcileRunDiscoveries(task, output) {
   const listen = text.match(/\b(127\.0\.0\.1|0\.0\.0\.0|localhost|\[::\]|::):(\d{2,5})\b/i);
   const appPort = listen?.[2] ?? text.match(/\b(?:PORT|port)\s*[=:]\s*(\d{2,5})\b/i)?.[1];
   const processName = text.match(/(?:pm2[^\n]*|name[^\n]*?)\b([a-z0-9][a-z0-9_-]*(?:airtel|starlink)[a-z0-9_-]*)\b/i)?.[1];
-  if (projectRoot && !task?.targetContext?.projectRoot) discovered.projectRoot = projectRoot;
+  if (!task?.isSslTask && projectRoot && !task?.targetContext?.projectRoot) discovered.projectRoot = projectRoot;
   if (inspectedFile) { discovered.currentFile = inspectedFile; if (/schema\.prisma$/i.test(inspectedFile)) discovered.schemaFile = inspectedFile; }
   if (appPort) discovered.appPort = Number(appPort);
   if (listen) discovered.appBind = listen[1].toLowerCase() === "localhost" ? "127.0.0.1" : listen[1];
@@ -116403,8 +116418,10 @@ void (async () => {
       const xd_compactSslPrompt = `You are the XDIGITEX Infrastructure/SSL specialist connected through the owned server record. Install and verify SSL only for ${task.sslDomain}. Use run_remote_command and a bounded sequence: compare DNS A/AAAA with the bound server; detect Nginx, Apache, LiteSpeed, OpenLiteSpeed or cPanel; identify the exact vhost/document root; inspect the existing SNI certificate; verify a temporary scoped ACME challenge; choose Certbot, webroot, AutoSSL or cPanel API from the detected environment; issue and bind the certificate; validate server configuration before a scoped reload; remove the challenge file; verify SAN, expiry, chain, normal HTTPS, correct site and renewal. A 404 is recoverable: diagnose and fix its route automatically. Never inspect application source or Git history, never touch another domain, never alter SSH/firewall, never expose private keys, never use -k/--insecure as final proof, and never ask whether to continue safe recovery. Never print command JSON. Do not return a final answer until every acceptance criterion has evidence; otherwise report only a verified external blocker or unrecoverable failure.`;
       var xd_finalSysPrompt = task.isSslTask ? `${xd_skRes.block}\n\n${xd_compactSslPrompt}` : xd_readOnlyTask ? xd_compactServerPrompt : (xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt);
       task.startupStage = "task.start"; task.startupTrace?.mark(task.startupStage, { taskKey: task.orchestration?.context?.todo?.find(item => item.status === "in_progress")?.key || null });
-      if (task.durableRunDbId) pool.query("UPDATE coding_agent_runs SET phase='running',metadata=metadata||$2::jsonb,updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ startup: { stage: task.startupStage, trace: task.startupTrace?.entries || [] } })]).catch(() => {});
-      chatTaskEmit(task, "task_started", { stage: task.startupStage, taskKey: task.orchestration?.context?.todo?.find(item => item.status === "in_progress")?.key || null });
+      const firstTaskKey = task.orchestration?.context?.todo?.find(item => ["in_progress", "running"].includes(item.status))?.key || task.orchestration?.context?.todo?.find(item => item.status === "pending")?.key;
+      task.activeTask = await startOrResumeTask(pool, { runId: task.durableRunDbId, taskId: task.durableTaskDbId, semanticKey: firstTaskKey, owner: task.activeSpecialist });
+      task.runPhase = "running";
+      if (task.durableRunDbId) await pool.query("UPDATE coding_agent_runs SET phase='running',metadata=metadata||$2::jsonb,updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ startup: { stage: "complete", trace: task.startupTrace?.entries || [] }, currentTaskId: String(task.activeTask.id), currentTaskSemanticKey: firstTaskKey })]);
       // ─────────────────────────────────────────────────────────────────────
       const aiMessages = [
         { role: "system", content: xd_finalSysPrompt },
@@ -116678,7 +116695,7 @@ Tell the user to check that the agent script is still running in their terminal 
           const previousBudget = softCommandBudget;
           softCommandBudget = Math.min(hardCommandLimit, softCommandBudget + (taskComplexity === "complex" ? 40 : taskComplexity === "moderate" ? 25 : 12));
           lastSoftBudgetSignal = totalCommands;
-          const remaining = task.durableTaskDbId ? await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress') ORDER BY position", [task.durableTaskDbId]) : { rows: [] };
+          const remaining = task.durableTaskDbId ? await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress','running') ORDER BY position", [task.durableTaskDbId]) : { rows: [] };
           aiMessages.push({ role: "user", content: `[SOFT EFFICIENCY BUDGET]\n${totalCommands} commands reached the efficiency threshold (${previousBudget}); this is not a completion condition. Compact context, discard redundant actions, reuse cached target/project facts, and continue only the smallest actions needed for these remaining criteria:\n${remaining.rows.map((row) => `- ${row.title}`).join("\n") || "- Re-evaluate the original request and verification evidence"}\nOnly stop for a demonstrated repeated loop, unsafe mutation, executor failure, external blocker, or insufficient credits.` });
           chatTaskEmit(task, "status", { text: "Compacting run context and continuing remaining work" });
         }
@@ -116975,7 +116992,7 @@ After fixing, verify the file works, then action="done".`
             const result = await client.chat.completions.create({
               model,
               messages: (/glm|z-ai/i.test(model) ? (()=>{ const LIM=27000; const totalLen=m=>m.reduce((s,x)=>s+String(x.content??"").length,0); const sys=aiMessages.filter(m=>m.role==="system"); let rest=aiMessages.filter(m=>m.role!=="system"); while(rest.length>1&&totalLen([...sys,...rest])>LIM)rest=rest.slice(1); let res=[...sys,...rest]; if(totalLen(res)>LIM&&sys.length>0){const budget=LIM-totalLen(rest); const ts={...sys[0],content:String(sys[0].content??"").slice(0,Math.max(0,budget-200))}; res=[ts,...rest];} return res; })() : aiMessages),
-              tools: hasSsh ? [EXECUTION_TOOL] : undefined,
+              tools: hasSsh ? [EXECUTION_TOOL, HOSTING_DETECTION_TOOL] : undefined,
               tool_choice: hasSsh ? "auto" : undefined,
               max_tokens: maxTok,
               temperature: iter === 0 ? 0.3 : 0.1,
@@ -117128,7 +117145,7 @@ After fixing, verify the file works, then action="done".`
         const completion = await callWithRetry();
         const actualProvider = completion._xdProvider || iterProvider, actualModel = completion._xdModel || iterModel;
         await settleServerAgentCredits(task, creditLedger, completion.usage, actualProvider, actualModel);
-        chatTaskEmit(task, "provider_turn", { primaryProvider: iterProvider, primaryModel: iterModel, provider: actualProvider, model: actualModel, fallback: actualProvider !== iterProvider || actualModel !== iterModel, toolsPassed: hasSsh ? 1 : 0, toolChoice: hasSsh ? "auto" : null, finishReason: completion.choices[0]?.finish_reason, toolCallCount: completion.choices[0]?.message?.tool_calls?.length || 0 });
+        chatTaskEmit(task, "provider_turn", { primaryProvider: iterProvider, primaryModel: iterModel, provider: actualProvider, model: actualModel, fallback: actualProvider !== iterProvider || actualModel !== iterModel, toolsPassed: hasSsh ? 2 : 0, toolChoice: hasSsh ? "auto" : null, finishReason: completion.choices[0]?.finish_reason, toolCallCount: completion.choices[0]?.message?.tool_calls?.length || 0 });
         iterProvider = actualProvider; iterModel = actualModel;
         if (completion.usage) {
           totalPromptTokens += completion.usage.prompt_tokens ?? 0;
@@ -117149,8 +117166,8 @@ After fixing, verify the file works, then action="done".`
               chatTaskEmit(task, "tool_failed", { toolCallId: call.id, toolName: call.name, code: checked.code, source: call.source });
               continue;
             }
-            commands.push({ cmd: checked.value.command, desc: checked.value.description, __toolCallId: call.id, __toolSource: call.source });
-            chatTaskEmit(task, "tool_requested", { toolCallId: call.id, toolName: call.name, summary: checked.value.description, source: call.source, taskId: task.durableTaskDbId });
+            commands.push({ cmd: checked.value.command, desc: checked.value.description, __toolCallId: call.id, __toolSource: call.source, __toolName: call.name });
+            chatTaskEmit(task, "tool_requested", { toolCallId: call.id, toolName: call.name, summary: checked.value.description, source: call.source, taskId: task.activeTask?.id, taskSemanticKey: task.activeTask?.semantic_key, owner: task.activeTask?.owner, serverId: s2.id });
           }
           if (commands.length) action = { action: "run", thought: commands[0].desc, commands };
           raw = JSON.stringify(action ?? { action: "continue" });
@@ -117305,6 +117322,13 @@ Retry your task using the cPanel actions above.`
         }
         if (action.action === "run" && Array.isArray(action.commands) && action.commands.length) {
           const cmds = action.commands.filter((c) => c && typeof c.cmd === "string").slice(0, 10);
+          const reconciled = await reconcileRun(pool, task.durableRunDbId);
+          if (!task.activeTask || !task.activeTask.id) {
+            const active = await pool.query("SELECT id,title,semantic_key,owner,status FROM agent_task_items WHERE task_id=$1 AND status IN ('running','in_progress','pending') ORDER BY CASE WHEN status IN ('running','in_progress') THEN 0 ELSE 1 END,position LIMIT 1", [task.durableTaskDbId]);
+            if (!active.rowCount) throw Object.assign(new Error("No runnable persisted task exists for this tool call"), { code: "TASK_DEPENDENCY_ERROR" });
+            task.activeTask = active.rows[0];
+          }
+          task.activeTask = await startOrResumeTask(pool, { runId: task.durableRunDbId, taskId: task.durableTaskDbId, semanticKey: task.activeTask.semantic_key || reconciled.currentTaskSemanticKey, owner: task.activeTask.owner || task.activeSpecialist });
           if (totalCommands + cmds.length > softCommandBudget) cmds.splice(Math.max(1, softCommandBudget - totalCommands));
           totalCommands += cmds.length;
           const normCmd = (c) => c.replace(/\s+/g, " ").trim();
@@ -117359,7 +117383,9 @@ DO NOT repeat these commands again.`;
             }
             let { cmd, desc: desc3 } = cmds[ci];
             const protocolCallId = cmds[ci].__toolCallId || randomUUID2();
+            const durableToolPublicId = randomUUID2();
             const protocolSource = cmds[ci].__toolSource || "legacy_json_compat";
+            const protocolToolName = cmds[ci].__toolName || "run_remote_command";
             if (task.isSslTask && /\b(?:certbot|acme\.sh)\b.*\b(?:certonly|run|install|issue)\b/i.test(cmd)) {
               if (lastSslIssueMutationEpoch === mutationEpoch) {
                 cmdResults.push(`$ ${cmd}\n[SSL_RETRY_BLOCKED]\nCertificate issuance was not retried because DNS, vhost, challenge routing, or certificate binding has not changed.\n[exit 75]`);
@@ -117401,9 +117427,10 @@ DO NOT repeat these commands again.`;
             trackFileWrites(cmd, task);
             let durableToolCall = null;
             if (task.durableRunDbId) {
-              durableToolCall = (await pool.query(`INSERT INTO agent_tool_calls(public_id,run_id,task_id,name,status,risk,input,started_at,source) VALUES($1,$2,$3,'run_remote_command','running','dynamic',$4,NOW(),$5) RETURNING id,public_id`, [protocolCallId, task.durableRunDbId, task.durableTaskDbId, JSON.stringify(redactSecrets({ serverId: s2.id, command: cmd, description: desc3 })), protocolSource])).rows[0];
+              durableToolCall = (await pool.query(`INSERT INTO agent_tool_calls(public_id,provider_call_id,run_id,task_id,task_item_id,name,status,risk,input,started_at,source) VALUES($1,$2,$3,$4,$5,$6,'running','dynamic',$7,NOW(),$8) RETURNING id,public_id`, [durableToolPublicId, protocolCallId, task.durableRunDbId, task.durableTaskDbId, task.activeTask.id, protocolToolName, JSON.stringify(redactSecrets({ serverId: s2.id, command: cmd, description: desc3, taskSemanticKey: task.activeTask.semantic_key })), protocolSource])).rows[0];
             }
-            chatTaskEmit(task, "tool_started", { toolCallId: protocolCallId, toolName: "run_remote_command", summary: desc3 || "Running server command", taskId: task.durableTaskDbId, source: protocolSource });
+            task.firstToolStartedAt ||= new Date();
+            chatTaskEmit(task, "tool_started", { toolCallId: protocolCallId, toolName: protocolToolName, summary: desc3 || "Running server command", taskId: task.activeTask.id, taskSemanticKey: task.activeTask.semantic_key, owner: task.activeTask.owner, serverId: s2.id, source: protocolSource });
             send2("cmd_start", { index: ci, total: cmds.length, cmd, desc: desc3 });
             const result = await executeServerCommand(s2, cmd, {
               onData: (chunk) => send2("cmd_output", { index: ci, chunk }),
@@ -117423,7 +117450,7 @@ DO NOT repeat these commands again.`;
             const toolClassification = result.code === 124 ? "COMMAND_TIMEOUT" : commandName === "grep" && result.code === 1 ? "NO_MATCH" : commandName === "grep" && result.code === 2 ? "TOOL_SYNTAX_ERROR" : commandName === "diff" && result.code === 1 ? "DIFFERENCES_FOUND" : commandName === "test" && result.code === 1 ? "CONDITION_FALSE" : result.code === 0 ? "SUCCESS" : "COMMAND_FAILURE";
             send2("cmd_done", { index: ci, code: result.code, classification: toolClassification });
             if (durableToolCall) await pool.query("UPDATE agent_tool_calls SET status=$2,result=$3,duration_ms=$4,completed_at=NOW() WHERE id=$1", [durableToolCall.id, result.code === 124 ? "timeout" : result.code === 0 ? "completed" : "failed", JSON.stringify(redactSecrets({ exitCode: result.code, stdout: result.stdout, stderr: result.stderr, classification: toolClassification })), null]);
-            chatTaskEmit(task, result.code === 0 ? "tool_completed" : "tool_failed", { toolCallId: protocolCallId, toolName: "run_remote_command", exitCode: result.code, classification: toolClassification, taskId: task.durableTaskDbId, source: protocolSource });
+            chatTaskEmit(task, result.code === 0 ? "tool_completed" : "tool_failed", { toolCallId: protocolCallId, toolName: protocolToolName, exitCode: result.code, classification: toolClassification, taskId: task.activeTask.id, taskSemanticKey: task.activeTask.semantic_key, owner: task.activeTask.owner, serverId: s2.id, source: protocolSource });
             if (toolClassification === "COMMAND_FAILURE" || toolClassification === "COMMAND_TIMEOUT") unresolvedCommandFailures.add(normCmd(cmd));
             else unresolvedCommandFailures.delete(normCmd(cmd));
             const rawOut = [
@@ -118541,7 +118568,7 @@ Do not ask whether to continue. Do not inspect application source or Git history
             }
           }
           if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText) && task.durableTaskDbId) {
-            const remainingTodos = await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress') ORDER BY position", [task.durableTaskDbId]);
+            const remainingTodos = await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress','running') ORDER BY position", [task.durableTaskDbId]);
             if (remainingTodos.rowCount && doneAttempts < 3) {
               doneAttempts++;
               aiMessages.push({ role: "assistant", content: raw }, { role: "user", content: `[DURABLE TODO GATE]\nThe run still has required work:\n${remainingTodos.rows.map((row) => `- ${row.title}`).join("\n")}\nContinue executing these recoverable deployment requirements. Do not return PARTIAL merely because a missing dependency, database configuration, port, process, vhost, or migration was discovered.` });
@@ -118796,9 +118823,12 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
     } catch (err) {
       if (task.status !== "blocked" && task.status !== "cancelled") task.status = "failed";
       const rawMsg = String(err instanceof Error ? err.message : err);
-      const startupFailure = classifyStartupFailure(err, task.startupStage);
+      const startupFailure = classifyTaskRuntimeFailure(err, { startupStage: task.startupStage, firstToolStartedAt: task.firstToolStartedAt, phase: task.runPhase });
       console.error("[server-agent-runtime]", { errorName: err instanceof Error ? err.name : typeof err, message: rawMsg, stack: err instanceof Error ? err.stack : undefined, runId: task.runId, conversationId: task.conversationId, serverId: s2.id, startupFailure });
-      if (task.durableRunDbId) pool.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb,error=$3,updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify({ startup: { stage: startupFailure.stage, trace: task.startupTrace?.entries || [], failure: startupFailure } }), startupFailure.code]).catch(() => {});
+      if (task.durableRunDbId) {
+        await reconcileRun(pool, task.durableRunDbId).catch(() => null);
+        pool.query("UPDATE coding_agent_runs SET metadata=metadata||$2::jsonb,error=$3,updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify(task.firstToolStartedAt ? { runtimeFailure: startupFailure, wastedTokensDueToInternalFailure: (task.inputTokens || 0) + (task.outputTokens || 0) } : { startup: { stage: startupFailure.stage, trace: task.startupTrace?.entries || [], failure: startupFailure } }), startupFailure.code]).catch(() => {});
+      }
       const userMsg = (() => {
         const m2 = rawMsg.toLowerCase();
         if (m2.includes("failed to fetch") || m2.includes("fetch failed") || m2.includes("econnrefused") || m2.includes("enotfound") || m2.includes("network") || m2.includes("connection error") || m2.includes("socket")) return "\u26A0\uFE0F Unable to reach AI service \u2014 please try again in a moment.";
@@ -118806,7 +118836,7 @@ If the site is unreachable for a known reason \u2192 emit done with STATUS: UNVE
         if (m2.includes("429") || m2.includes("rate limit") || m2.includes("quota")) return "\u26A0\uFE0F AI service is busy \u2014 please wait a moment and try again.";
         if (m2.includes("timed out") || m2.includes("timeout") || m2.includes("aborted")) return "\u26A0\uFE0F AI service timed out \u2014 the server may be under heavy load. Please try again.";
         if (m2.includes("context") && m2.includes("length")) return "\u26A0\uFE0F Request too long \u2014 please start a new conversation or shorten your message.";
-        return `Run initialization failed before the first task completed.\n\nStage: ${startupFailure.stage}\nError code: ${startupFailure.code}\nNo unbilled work was charged.`;
+        return task.firstToolStartedAt ? `The task-state transition failed after execution had started. Completed evidence was preserved.\n\nStage: ${startupFailure.stage}\nError code: ${startupFailure.code}` : `Run initialization failed before the first task started.\n\nStage: ${startupFailure.stage}\nError code: ${startupFailure.code}\nNo unbilled work was charged.`;
       })();
       send2("error", { text: userMsg });
       if (!task.lastReply) send2("reply", { text: `Failed.\n\nReason:\n${userMsg}\n\nCompleted work, if any, has been preserved.` });

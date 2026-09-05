@@ -11,7 +11,7 @@ export const messageRoleEnum = pgEnum("conversation_message_role", ["user", "ass
 export const runStatusEnum = pgEnum("agent_run_status", [
   "queued", "planning", "running", "waiting_for_tool", "verifying", "completed", "partially_completed", "blocked", "failed", "cancelled", "insufficient_credits",
 ]);
-export const taskItemStatusEnum = pgEnum("agent_task_item_status", ["pending", "in_progress", "completed", "failed", "skipped"]);
+export const taskItemStatusEnum = pgEnum("agent_task_item_status", ["created", "pending", "in_progress", "running", "completed", "failed", "blocked", "skipped"]);
 export const toolCallStatusEnum = pgEnum("agent_tool_call_status", ["queued", "running", "completed", "failed", "timeout", "cancelled", "waiting_approval"]);
 export const approvalStatusEnum = pgEnum("agent_approval_status", ["pending", "approved", "rejected", "edited"]);
 export const usageStatusEnum = pgEnum("agent_usage_status", ["reserved", "settled", "released", "failed"]);
@@ -79,11 +79,13 @@ export const agentTaskItemsTable = pgTable("agent_task_items", {
   id: serial("id").primaryKey(), taskId: integer("task_id").notNull().references(() => agentTasksTable.id, { onDelete: "cascade" }),
   position: integer("position").notNull(), title: text("title").notNull(), status: taskItemStatusEnum("status").notNull().default("pending"),
   required: boolean("required").notNull().default(true), evidence: jsonb("evidence").notNull().default({}),
+  semanticKey: text("semantic_key"), owner: text("owner"), startedAt: timestamp("started_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(), updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 }, (t) => [uniqueIndex("agent_task_items_position_uidx").on(t.taskId, t.position)]);
 
 export const toolCallsTable = pgTable("agent_tool_calls", {
   id: serial("id").primaryKey(), publicId: text("public_id").notNull().unique(), runId: integer("run_id").notNull().references(() => agentRunsTable.id, { onDelete: "cascade" }),
+  taskItemId: integer("task_item_id").references(() => agentTaskItemsTable.id, { onDelete: "set null" }), providerCallId: text("provider_call_id"), source: text("source").notNull().default("native"),
   name: text("name").notNull(), status: toolCallStatusEnum("status").notNull().default("queued"), risk: text("risk").notNull().default("low"),
   input: jsonb("input").notNull().default({}), result: jsonb("result"), startedAt: timestamp("started_at", { withTimezone: true }), completedAt: timestamp("completed_at", { withTimezone: true }),
   durationMs: integer("duration_ms"), createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),

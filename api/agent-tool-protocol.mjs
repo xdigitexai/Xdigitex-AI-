@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 export const EXECUTION_TOOL = Object.freeze({ type: "function", function: { name: "run_remote_command", description: "Run one command on the server already bound to this run. Backend-owned credentials are used.", parameters: { type: "object", additionalProperties: false, required: ["command"], properties: { command: { type: "string", minLength: 1 }, description: { type: "string" }, timeout: { type: "integer", minimum: 1, maximum: 900 } } } } });
+export const HOSTING_DETECTION_TOOL = Object.freeze({ type: "function", function: { name: "detect_hosting_environment", description: "Deterministically detect privilege, cPanel, web server, account home, domain metadata and SSL management in one read-only probe.", parameters: { type: "object", additionalProperties: false, required: ["domain"], properties: { domain: { type: "string", pattern: "^[a-zA-Z0-9.-]+$" } } } } });
 export const EXECUTION_CAPABILITIES = Object.freeze({ toolCalling: true, streaming: false, structuredOutput: true });
 
 function exactJson(text) { const value = String(text ?? "").trim(); const fenced = value.match(/^```json\s*([\s\S]*?)\s*```$/i); const candidate = fenced ? fenced[1].trim() : value; if (!candidate.startsWith("{") || !candidate.endsWith("}")) return null; try { return JSON.parse(candidate); } catch { return null; } }
@@ -21,6 +22,12 @@ export function normalizeModelTurn(message, options = {}) {
 }
 
 export function validateRemoteToolCall(call) {
+  if (call?.name === "detect_hosting_environment") {
+    const domain = String(call.arguments?.domain ?? "").toLowerCase();
+    if (!/^(?:[a-z0-9-]+\.)+[a-z]{2,}$/.test(domain)) return { valid: false, code: "INVALID_TOOL_ARGUMENTS", message: "A valid domain is required." };
+    const command = `printf 'user=%s\\nuid=%s\\naccountHome=%s\\n' "$(id -un)" "$(id -u)" "$HOME"; if [ -d /usr/local/cpanel ] || command -v uapi >/dev/null 2>&1; then echo 'cpanel=true'; else echo 'cpanel=false'; fi; for p in /usr/local/apache /usr/local/lsws /etc/httpd /etc/apache2 /etc/nginx; do [ -e "$p" ] && printf 'path=%s\\n' "$p"; done; ps -eo comm,args 2>/dev/null | grep -E '[l]itespeed|[l]shttpd|[h]ttpd|[a]pache2|[n]ginx' | head -20; if command -v uapi >/dev/null 2>&1; then uapi --output=json DomainInfo single_domain_data domain='${domain}' 2>/dev/null || true; uapi --output=json SSL installed_hosts 2>/dev/null || true; fi`;
+    return { valid: true, value: { command, description: `Detect hosting environment for ${domain}`, timeout: 60 } };
+  }
   if (call?.name !== "run_remote_command") return { valid: false, code: "UNKNOWN_TOOL", message: `Unknown tool: ${call?.name || "(missing)"}` };
   if (!call.arguments || typeof call.arguments !== "object") return { valid: false, code: "INVALID_TOOL_ARGUMENTS", message: "Tool arguments must be valid JSON." };
   if (typeof call.arguments.command !== "string" || !call.arguments.command.trim()) return { valid: false, code: "INVALID_TOOL_ARGUMENTS", message: "command is required." };

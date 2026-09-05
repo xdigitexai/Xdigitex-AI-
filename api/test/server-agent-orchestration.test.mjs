@@ -19,8 +19,9 @@ test("server agent applies bounded cycle and command budgets", () => {
 test("runtime failures log correlated stack details but return a safe message", () => {
   assert.match(source, /\[server-agent-runtime\]/);
   assert.match(source, /stack: err instanceof Error \? err\.stack/);
-  assert.match(source, /classifyStartupFailure/);
-  assert.match(source, /Run initialization failed before the first task completed/);
+  assert.match(source, /classifyTaskRuntimeFailure/);
+  assert.match(source, /Run initialization failed before the first task started/);
+  assert.match(source, /The task-state transition failed after execution had started/);
   assert.match(source, /startupFailure/);
 });
 
