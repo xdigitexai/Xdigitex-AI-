@@ -1,4 +1,7 @@
 const calling = /\b(audio|video|webrtc|calling|call system|turn relay|stun|ice candidate|socket\.io)\b/i
+const ssl = /\b(?:install|issue|renew|configure|fix|enable)\b.{0,30}\b(?:ssl|tls|https|certificate|certbot|let'?s encrypt|autossl)\b|\b(?:ssl|tls|https|certificate|certbot|let'?s encrypt|autossl)\b.{0,30}\b(?:install|issue|renew|configure|fix|enable)\b/i
+
+export function isSslRequest(request) { return ssl.test(String(request || "")) }
 
 export function detectRunType(request) {
   const text = String(request || "")
@@ -11,6 +14,13 @@ export function detectRunType(request) {
 }
 
 export function deriveAcceptanceCriteria(request) {
+  if (isSslRequest(request)) return [
+    ["dns_binding", "Domain resolves to the expected server", "ssl"], ["vhost_identified", "Correct vhost and document root identified", "infrastructure"],
+    ["acme_reachable", "ACME challenge path is publicly reachable", "ssl"], ["certificate_issued", "Certificate issued", "ssl"],
+    ["certificate_bound", "Certificate installed and bound to the requested hostname", "ssl"], ["hostname_match", "Certificate SAN covers the requested hostname", "testing"],
+    ["https_handshake", "HTTPS handshake and certificate chain succeed", "testing"], ["no_mismatch", "SNI serves no certificate mismatch", "testing"],
+    ["public_https", "Public HTTPS verification passes without insecure mode", "testing"], ["renewal", "Certificate renewal mechanism verified", "ssl"],
+  ].map(([key, title, owner]) => ({ key, title, owner, status: "not_tested", evidence: [], required: true }))
   if (calling.test(String(request || ""))) return [
     ["calling_architecture", "Calling architecture detected", "realtime"], ["signaling_backend", "Signaling backend inspected", "backend"],
     ["webrtc_frontend", "Frontend WebRTC lifecycle inspected", "frontend"], ["call_persistence", "Call persistence inspected", "database"],
@@ -26,6 +36,7 @@ export function deriveAcceptanceCriteria(request) {
 
 export function requestSpecificTodo(request, target = {}) {
   const criteria = deriveAcceptanceCriteria(request)
+  if (isSslRequest(request)) return criteria.map((item, index) => ({ key: item.key, title: item.title, owner: item.owner, status: index === 0 ? "in_progress" : "pending", source: "ssl_acceptance" }))
   if (calling.test(String(request || ""))) return criteria.map((item, index) => ({ key: item.key, title: item.title.replace(/ verified| tested/i, match => match), owner: item.owner, status: index === 0 ? "in_progress" : "pending", source: "acceptance_criterion" }))
   return []
 }
@@ -45,6 +56,7 @@ export function canonicalRunResult({ requestedStatus, acceptance = [], todo = []
 }
 
 export function conciseRunTitle(request, projectName) {
+  if (isSslRequest(request)) { const domain=String(request).match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b/i)?.[0]; return `${domain || projectName || "Domain"} — SSL` }
   if (calling.test(String(request || ""))) return `${projectName || "Project"} — Calling System`
   const clean = String(request || "Task").replace(/https?:\/\/\S+/g, "").replace(/[#*_`]/g, "").replace(/\s+/g, " ").trim()
   return clean.split(" ").slice(0, 8).join(" ") || "Server task"

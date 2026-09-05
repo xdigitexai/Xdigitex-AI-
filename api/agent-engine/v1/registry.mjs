@@ -17,6 +17,7 @@ const definitions = {
   testing: { file: "testing.md", skills: [] },
   debugging: { file: "debugging.md", skills: ["debugging"] },
   realtime: { file: "realtime.md", skills: ["webrtc", "socketio", "turn", "prisma"] },
+  ssl: { file: "ssl.md", skills: ["ssl"] },
   vps: { file: "adapters/vps.md", skills: ["vps", "ssh"] },
   cpanel: { file: "adapters/cpanel.md", skills: ["cpanel"] },
   local: { file: "adapters/local.md", skills: [] },
@@ -31,6 +32,7 @@ const skillFiles = {
   cpanel: "../../skills/devops/cpanel.md", website: "../../skills/verification/website.md",
   api: "../../skills/verification/api.md", pnpm: "skills/pnpm.md", npm: "skills/npm.md",
   pm2: "skills/pm2.md", systemd: "skills/systemd.md", express: "skills/express.md", webrtc: "skills/webrtc.md", socketio: "skills/socketio.md", turn: "skills/turn.md", prisma: "skills/prisma.md",
+  ssl: "skills/ssl.md",
 };
 
 const textOf = (input) => [input.request, input.context?.currentTask, ...(input.todo || []).map(t => `${t.key || ""} ${t.title || ""}`), ...(input.context?.findings || [])].join(" ").toLowerCase();
@@ -41,6 +43,7 @@ export function selectSpecialists(input = {}) {
   const text = textOf(input);
   const agents = new Set(["orchestrator"]);
   const target = input.context?.target?.type || "";
+  const sslOnly = /\b(?:ssl|tls|https|certificate|certbot|let'?s encrypt|autossl|acme)\b/.test(text) && !/\b(?:git|github|commit|push|application code|frontend|database)\b/.test(text);
   const git = has(text, /\b(git|github|repository|repo|clone|pull|push|commit|branch|checkout|fetch|merge|rebase)\b/);
   const deploy = has(text, /\b(deploy|deployment|publish|production|restart|pm2|systemd|nginx|apache|ssl|domain|vhost)\b/);
   const frontend = has(text, /\b(frontend|react|vue|svelte|css|stylesheet|browser|ui|asset|vite|next(?:js)?|unstyled)\b/);
@@ -50,13 +53,14 @@ export function selectSpecialists(input = {}) {
   const coding = has(text, /\b(build|implement|create|code|refactor|feature|function|class|file)\b/) || (debug && !deploy);
   const realtime = has(text, /\b(webrtc|audio call|video call|calling|signaling|socket\.io|stun|turn|ice candidate|media track|rtcstats)\b/);
 
-  if (deploy) add(agents, "deployment", "testing");
+  if (sslOnly) add(agents, "ssl", "infrastructure", "testing");
+  else if (deploy) add(agents, "deployment", "testing");
   if (git) add(agents, "github");
   if (frontend) add(agents, "frontend");
   if (database) add(agents, "database");
   if (backend) add(agents, "backend");
   if (debug) add(agents, "debugging");
-  if (coding) add(agents, "coding");
+  if (coding && !sslOnly) add(agents, "coding");
   if (realtime) add(agents, "realtime", "frontend", "backend", "testing");
   if (deploy && has(text, /\b(nginx|apache|ssl|tls|certbot|proxy|pm2|systemd|docker|domain|vhost)\b/)) add(agents, "infrastructure");
   if (target === "cpanel" || has(text, /\bcpanel\b/)) add(agents, "cpanel");

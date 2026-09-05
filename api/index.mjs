@@ -4,7 +4,8 @@ import __bannerUrl from 'node:url';
 import { semanticTaskKey, normalizeProjectRoot } from './agent-task-identity.mjs';
 import { OrchestratorCore, applyTodoOperations, renderTodoMarkdown } from './orchestrator/index.mjs';
 import { loadRegistrySelection } from './agent-engine/v1/registry.mjs';
-import { canonicalRunResult, conciseRunTitle, deriveAcceptanceCriteria, detectRunType, professionalFinalReport, requestSpecificTodo } from './run-results-runtime.mjs';
+import { canonicalRunResult, conciseRunTitle, deriveAcceptanceCriteria, detectRunType, isSslRequest, professionalFinalReport, requestSpecificTodo } from './run-results-runtime.mjs';
+import { compactSslResults, sslDomain, sslEvidenceFromResults, sslRecoveryFromResults } from './ssl-runtime.mjs';
 
 globalThis.require = __bannerCrReq(import.meta.url);
 globalThis.__filename = __bannerUrl.fileURLToPath(import.meta.url);
@@ -112447,6 +112448,8 @@ async function bridgeServerAgentRunStart(task, server, prompt) {
   const targetContext = { targetType, targetId: server.id, serverId: server.id, host: server.host, port: server.port, sshPort: server.port, username: server.username, serverPublicIp, projectName: repository?.split("/").pop() ?? null, repository, domain };
   task.targetContext = targetContext;
   task.runType = detectRunType(promptText);
+  task.isSslTask = isSslRequest(promptText);
+  task.sslDomain = task.isSslTask ? sslDomain(promptText) : null;
   task.acceptance = deriveAcceptanceCriteria(promptText);
   task.acceptanceCritical = task.acceptance.length > 1;
   task.runTitle = conciseRunTitle(promptText, targetContext.projectName || server.name);
@@ -112552,6 +112555,33 @@ async function completeRunTask(task, evidence) {
     chatTaskEmit(task, "task_complete", { task: item.title, position: item.position });
     if (next.rowCount) chatTaskEmit(task, "task_start", { task: next.rows[0].title, position: next.rows[0].position });
   } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+}
+async function applySslRunEvidence(task, results) {
+  if (!task?.isSslTask || !task.durableTaskDbId) return;
+  const findings = sslEvidenceFromResults(results, task.sslDomain), recovery = sslRecoveryFromResults(results, task.sslDomain);
+  if (/certbot|acme|certificate/i.test(results.join("\n")) && /unauthorized|invalid response|failed to obtain|certificate issuance failed/i.test(results.join("\n"))) {
+    const criterion = task.acceptance.find(item => item.key === "certificate_issued");
+    if (criterion) Object.assign(criterion, { status: "failed", evidence: [recovery.summary || "Certificate issuance failed"] });
+  }
+  for (const finding of findings) {
+    const criterion = task.acceptance.find(item => item.key === finding.key);
+    if (criterion) Object.assign(criterion, finding);
+    const memoryItem = task.orchestration?.context?.todo?.find(item => item.key === finding.key);
+    if (memoryItem) Object.assign(memoryItem, { status: "completed", evidence: finding.evidence });
+    await pool.query("UPDATE agent_task_items SET status='completed',evidence=evidence||$3::jsonb,updated_at=NOW() WHERE task_id=$1 AND evidence->>'taskKey'=$2", [task.durableTaskDbId, finding.key, JSON.stringify({ verificationResult: "passed", evidence: finding.evidence })]);
+    chatTaskEmit(task, "verification_result", finding);
+  }
+  if (recovery.tasks.length) {
+    const previousHash = task.sslRecoveryStateHash;
+    task.sslRecoveryStateHash = recovery.stateHash;
+    if (previousHash !== recovery.stateHash) await addRunTasks(task, recovery.tasks, "ssl_recovery");
+    chatTaskEmit(task, "ssl_recovery", { domain: task.sslDomain, recoverable: true, summary: recovery.summary, tasks: recovery.tasks });
+  }
+  await pool.query("UPDATE agent_task_items SET status='pending',updated_at=NOW() WHERE task_id=$1 AND status='in_progress'", [task.durableTaskDbId]);
+  const next = await pool.query("UPDATE agent_task_items SET status='in_progress',updated_at=NOW() WHERE id=(SELECT id FROM agent_task_items WHERE task_id=$1 AND status='pending' ORDER BY position LIMIT 1) RETURNING title,position", [task.durableTaskDbId]);
+  const memoryTodo = task.orchestration?.context?.todo;
+  if (next.rowCount && memoryTodo?.[next.rows[0].position - 1]) memoryTodo[next.rows[0].position - 1].status = "in_progress";
+  await pool.query("UPDATE coding_agent_runs SET metadata=jsonb_set(metadata,'{acceptance}',$2::jsonb,true),updated_at=NOW() WHERE id=$1", [task.durableRunDbId, JSON.stringify(task.acceptance)]);
 }
 function formatTerminalRunReport({ message, request, task, durationMs, completedTasks, totalTasks }) {
   const todo = task.acceptanceCritical ? [] : task.orchestration?.context?.todo || [];
@@ -116296,8 +116326,8 @@ void (async () => {
       const requestedWebPath = requestedUrlMatch?.[2] ?? requestedDomainPathMatch?.[2] ?? "/";
       const simpleTaskFastPath = !!explicitTargetMatch && /\b(add|change|edit|replace|remove|rename|fix|check)\b/i.test(userTaskText) && !/\b(database|migration|schema|multiple|entire|full system|architecture|rebuild)\b/i.test(userTaskText);
       const [pastExperiences, knowledgeResult] = await Promise.all([
-        simpleTaskFastPath ? Promise.resolve([]) : searchExperiences(userTaskText, 3, s2.id).catch(() => []),
-        simpleTaskFastPath ? Promise.resolve({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }) : buildKnowledgeBlock(userTaskText).catch(() => ({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }))
+        simpleTaskFastPath || task.isSslTask ? Promise.resolve([]) : searchExperiences(userTaskText, 3, s2.id).catch(() => []),
+        simpleTaskFastPath || task.isSslTask ? Promise.resolve({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }) : buildKnowledgeBlock(userTaskText).catch(() => ({ block: "", detected: { webServer: [], language: [], framework: [], database: [], platform: [], frontend: [], devops: [] } }))
       ]);
       const memoryBlock = formatMemoryBlock(pastExperiences);
       const knowledgeBlock = knowledgeResult.block;
@@ -116339,7 +116369,7 @@ void (async () => {
       try {
         // Exact-file/simple requests must not inherit broad site, checkout, auth,
         // or payment verification profiles. The fast path verifies only the task.
-        xd_verPlan = simpleTaskFastPath ? {profiles:[],steps:[],missionBlock:"",needsAuth:false,canSelfRegister:false} : xd_runVerificationEngine(userTaskText, 3);
+        xd_verPlan = simpleTaskFastPath || task.isSslTask ? {profiles:[],steps:[],missionBlock:"",needsAuth:false,canSelfRegister:false} : xd_runVerificationEngine(userTaskText, 3);
         if (xd_verPlan.profiles.length > 0) {
           send2("verification_plan", {
             profiles: xd_verPlan.profiles.map(function(m) { return { name: m.profile.meta.name, file: m.profile.file, confidence: m.confidence, keywords: m.matchedKeywords }; }),
@@ -116353,16 +116383,17 @@ void (async () => {
       }
       const xd_readOnlyTask = /\b(check|inspect|status|report|show|list|verify|diagnose)\b/i.test(userTaskText) && (/\b(?:do not|don't|without)\s+(?:make\s+)?(?:any\s+)?(?:changes?|modify|restart|reload|write|install|configure|deploy|delete|remove|update)\b/i.test(userTaskText) || !/\b(fix|change|modify|write|create|install|restart|reload|deploy|delete|remove|update|configure)\b/i.test(userTaskText));
       const xd_compactServerPrompt = `You are XDIGITEX Server Agent connected only to ${s2.username}@${s2.host}:${s2.port}. Complete the user's read-only request autonomously. Use the minimum targeted commands and never modify files, configuration, services, SSH settings, authentication, or firewall rules. Every command must have a timeout. Do not repeat an unchanged command. Respond with exactly one JSON object per turn: {"thought":"short user-facing progress","action":"run","commands":[{"cmd":"timeout 30 <read-only command>","desc":"purpose"}]} or, only after the requested behavior is verified, {"thought":"verified","action":"done","message":"Completed.\\n\\nFindings:\\n...\\n\\nVerification:\\n..."}. A command completing is not the task completing; continue until all parts of the request are checked. Keep output concise and never expose internal notes.`;
-      var xd_finalSysPrompt = xd_readOnlyTask ? xd_compactServerPrompt : (xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt);
+      const xd_compactSslPrompt = `You are the XDIGITEX Infrastructure/SSL specialist connected through the owned server record. Install and verify SSL only for ${task.sslDomain}. Use a bounded sequence: compare DNS A/AAAA with the bound server; detect Nginx, Apache, LiteSpeed, OpenLiteSpeed or cPanel; identify the exact vhost/document root; inspect the existing SNI certificate; verify a temporary scoped ACME challenge; choose Certbot, webroot, AutoSSL or cPanel API from the detected environment; issue and bind the certificate; validate server configuration before a scoped reload; remove the challenge file; verify SAN, expiry, chain, normal HTTPS, correct site and renewal. A 404 is recoverable: diagnose and fix its route automatically. Never inspect application source or Git history, never touch another domain, never alter SSH/firewall, never expose private keys, never use -k/--insecure as final proof, and never ask whether to continue safe recovery. Respond with one JSON action and concise commands. Do not emit done until every acceptance criterion has evidence; otherwise report only a verified external blocker or unrecoverable failure.`;
+      var xd_finalSysPrompt = task.isSslTask ? `${xd_skRes.block}\n\n${xd_compactSslPrompt}` : xd_readOnlyTask ? xd_compactServerPrompt : (xd_skRes.block ? xd_skRes.block + "\n\n" + systemPrompt : systemPrompt);
       // ─────────────────────────────────────────────────────────────────────
       const aiMessages = [
         { role: "system", content: xd_finalSysPrompt },
-        ...parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content }))
+        ...(task.isSslTask ? [{ role: "user", content: userTaskText.slice(0, 1200) }] : parsed.data.messages.map((m2) => ({ role: m2.role, content: m2.content })))
       ];
       aiMessages.push({ role: "user", content: `[REMOTE EXECUTION CONTRACT]\nYou are already connected through the owned server record (serverId ${s2.id}) and its saved ${s2.authType ?? "key"} credential. Every action=run command executes remotely through the backend SSH connection service. Never run ssh, sshpass, scp, sftp, or construct username@host authentication commands. Supply only the command that should execute on the connected server.` });
       if (task.attachmentContext?.length) aiMessages.push({ role: "user", content: `[ATTACHMENT REFERENCES]\nUse only attachments relevant to the active specialist. Uploading a file does not authorize execution. ZIP manifests are lazy-inspected and archive contents must not be broadly injected into context.\n${task.attachmentContext.map(file => `- ${file.public_id}: ${file.name} (${file.mime_type}, ${file.size_bytes} bytes)${file.comment ? ` — ${file.comment}` : ""}; status=${file.processing_status}; routed=${(file.metadata?.specialists || []).join(",")}${file.manifest ? `; manifest=${JSON.stringify(file.manifest).slice(0, 3000)}` : ""}${file.preview ? `; preview=${String(file.preview).slice(0, 3000)}` : ""}`).join("\n")}` });
       if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText)) aiMessages.push({ role: "user", content: `[PROFESSIONAL DEPLOYMENT CONTRACT]\nWork manifest-first and stay bounded: inspect only existing deployment manifests, package/runtime manifests, README deployment instructions, environment examples, and the actual entry point before reading source. Detect Docker/Compose before reconstructing a manual deployment. Cache the discovered stack, package manager, project root, process manager, web server, application bind and port; do not rediscover unchanged facts. Treat every project as isolated and never stop another project to obtain a preferred port.\n\nExplicitly distinguish the connected execution target (VPS, cPanel/shared hosting, or local computer) from browser verification. On a VPS, detect whether the app listens on loopback or a public interface and perform the correct origin check from the VPS. On cPanel, discover the requested domain's real document root; never assume public_html. Origin health is never final website health. The final website check uses the actual HTTPS hostname (or curl --resolve with hostname/SNI while DNS propagates), without --insecure.\n\nBefore deployment, derive expected behavior from the repository: API-only, frontend, or full-stack, plus at least one recognizable title, brand, root element, or asset. For frontend/full-stack work, inspect the public response body and separately verify referenced JavaScript/CSS/assets; JSON health at / and PM2 online do not prove a frontend deployment. Verify the API separately when present. If the public root serves an API, default page, stale app, blank shell, or broken assets instead of the expected frontend, fix routing and continue. Use a real browser when available for final render verification.\n\nComplete safe prerequisites autonomously. If DATABASE_URL is missing, inspect the actual ORM/schema/migrations, provision an isolated database and application user when safe, configure secrets without printing them, migrate, restart only the target process, and verify fresh logs and database-backed behavior. Add newly discovered requirements to the durable TODO immediately. Finish only when the requested application is accessible at its requested destination, or report the exact external blocker and preserved state.` });
-      if (requestedDomain) aiMessages.push({ role: "user", content: `[DOMAIN TARGET BINDING]\nSSH execution target: ${s2.username}@${s2.host}:${s2.port}. Website target: https://${requestedDomain}${requestedWebPath}. These are different identities: the server IP can serve a default virtual host and an HTTP 403 from the raw IP does not mean the requested domain failed. The expected project root is /home/${s2.username}/${requestedDomain}; stay inside that root unless direct evidence proves a different document root. Search requested literals with grep -nF, not regex grep. Verify the hostname URL first; if DNS routing is unavailable, use curl --resolve ${requestedDomain}:443:${s2.host} https://${requestedDomain}${requestedWebPath}. A login redirect can be valid behavior. For a small source change, exact source/literal evidence plus the relevant syntax check is sufficient; a browser screenshot is optional and its absence must not force PARTIAL. Once the requested state and relevant verification pass, emit done immediately without extra discovery commands.` });
+      if (requestedDomain && !task.isSslTask) aiMessages.push({ role: "user", content: `[DOMAIN TARGET BINDING]\nSSH execution target: ${s2.username}@${s2.host}:${s2.port}. Website target: https://${requestedDomain}${requestedWebPath}. These are different identities: the server IP can serve a default virtual host and an HTTP 403 from the raw IP does not mean the requested domain failed. The expected project root is /home/${s2.username}/${requestedDomain}; stay inside that root unless direct evidence proves a different document root. Search requested literals with grep -nF, not regex grep. Verify the hostname URL first; if DNS routing is unavailable, use curl --resolve ${requestedDomain}:443:${s2.host} https://${requestedDomain}${requestedWebPath}. A login redirect can be valid behavior. For a small source change, exact source/literal evidence plus the relevant syntax check is sufficient; a browser screenshot is optional and its absence must not force PARTIAL. Once the requested state and relevant verification pass, emit done immediately without extra discovery commands.` });
       if (simpleTaskFastPath) aiMessages.push({ role: "user", content: `[SIMPLE TASK FAST PATH]\nOriginal request (authoritative): ${userTaskText.slice(0, 1200)}\nExact target: ${explicitTargetMatch[1]}\nInspect this exact source file first. If the requested state already exists, do not edit it: run one relevant syntax check, verify the requested meaning, then finish. Otherwise make only the requested change, run one relevant syntax check, optionally perform at most one live visual check, then finish. Do not scan the project, read generated caches/vendor/node_modules, invent optional requirements, or restart planning.` });
       {
         const bridgeNowConnected = isConnected(s2.userId);
@@ -116519,12 +116550,14 @@ Tell the user to check that the agent script is still running in their terminal 
       const commandResultCache = /* @__PURE__ */ new Map();
       const unresolvedCommandFailures = /* @__PURE__ */ new Set();
       let mutationEpoch = 0;
+      let lastSslIssueMutationEpoch = -1;
       let lastSoftBudgetSignal = -1;
+      let sslEfficiencyWarned = false;
       const originalUserMessage = parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "";
-      const taskComplexity = simpleTaskFastPath ? "simple" : /\b(rebuild|migrate|architecture|entire|full|multiple|complete system)\b/i.test(originalUserMessage) ? "complex" : /\b(deploy|install|implement|redesign|integrate)\b/i.test(originalUserMessage) ? "moderate" : "simple";
-      const maxIterations = taskComplexity === "complex" ? 60 : taskComplexity === "moderate" ? 40 : 16;
-      let softCommandBudget = taskComplexity === "complex" ? 80 : taskComplexity === "moderate" ? 40 : 12;
-      const hardCommandLimit = taskComplexity === "complex" ? 180 : taskComplexity === "moderate" ? 100 : 36;
+      const taskComplexity = task.isSslTask || simpleTaskFastPath ? "simple" : /\b(rebuild|migrate|architecture|entire|full|multiple|complete system)\b/i.test(originalUserMessage) ? "complex" : /\b(deploy|install|implement|redesign|integrate)\b/i.test(originalUserMessage) ? "moderate" : "simple";
+      const maxIterations = task.isSslTask ? 14 : taskComplexity === "complex" ? 60 : taskComplexity === "moderate" ? 40 : 16;
+      let softCommandBudget = task.isSslTask ? 16 : taskComplexity === "complex" ? 80 : taskComplexity === "moderate" ? 40 : 12;
+      const hardCommandLimit = task.isSslTask ? 32 : taskComplexity === "complex" ? 180 : taskComplexity === "moderate" ? 100 : 36;
       const homeDir = s2.username === "root" ? "/root" : `/home/${s2.username}`;
       let currentRole = "task_manager";
       let consecutiveFailBatches = 0;
@@ -116609,6 +116642,12 @@ Tell the user to check that the agent script is still running in their terminal 
       };
       let hasAddedMaxStepsWarning = false;
       for (let iter = 0; iter < maxIterations; iter++) {
+        if (task.isSslTask && totalPromptTokens + totalCompletionTokens > 60000 && !sslEfficiencyWarned) {
+          sslEfficiencyWarned = true;
+          const recent = aiMessages.slice(-4);
+          aiMessages.splice(1, aiMessages.length - 1, { role: "user", content: `[SSL EFFICIENCY WARNING]\nToken use exceeded the expected simple-infrastructure range. Stop broad discovery. Use only the current SSL TODO, last findings, and one direct recovery action. Do not read application code, repository history, or unrelated configuration.` }, ...recent);
+          chatTaskEmit(task, "efficiency_warning", { type: "token_anomaly", tokens: totalPromptTokens + totalCompletionTokens, threshold: 60000 });
+        }
         if (totalCommands >= softCommandBudget && totalCommands > lastSoftBudgetSignal) {
           const repeatedFailure = consecutiveFailBatches >= 3 || [...cmdRunCount.values()].some((count) => count >= 3);
           if (totalCommands >= hardCommandLimit && repeatedFailure) {
@@ -117266,6 +117305,13 @@ DO NOT repeat these commands again.`;
               break;
             }
             let { cmd, desc: desc3 } = cmds[ci];
+            if (task.isSslTask && /\b(?:certbot|acme\.sh)\b.*\b(?:certonly|run|install|issue)\b/i.test(cmd)) {
+              if (lastSslIssueMutationEpoch === mutationEpoch) {
+                cmdResults.push(`$ ${cmd}\n[SSL_RETRY_BLOCKED]\nCertificate issuance was not retried because DNS, vhost, challenge routing, or certificate binding has not changed.\n[exit 75]`);
+                continue;
+              }
+              lastSslIssueMutationEpoch = mutationEpoch;
+            }
             const isLongRunningBuild = /\b(?:pnpm|npm|yarn)\s+(?:install|ci|build)|\bdocker\s+build|\bcomposer\s+install/i.test(cmd);
             if (isLongRunningBuild && /^\s*timeout\s+\d+\s+/i.test(cmd)) cmd = cmd.replace(/^\s*timeout\s+\d+\s+/i, "timeout 900 ");
             if (/(?:^|[;&|]\s*)(?:timeout\s+\d+\s+)?(?:ssh|sshpass|scp|sftp)\b/i.test(cmd)) {
@@ -117345,7 +117391,7 @@ ${out}
             send2("reply", { text: "Blocked.\n\nReason:\nInsufficient credits.\n\nCompleted work has been preserved. Please add credits to continue using the AI Coding Agent." });
             break;
           }
-          const resultText = cmdResults.join("\n\n\u2500\u2500\u2500\u2500\u2500\n\n");
+          const resultText = task.isSslTask ? compactSslResults(cmdResults) : cmdResults.join("\n\n\u2500\u2500\u2500\u2500\u2500\n\n");
           const resultHash = createHash("sha256").update(resultText).digest("hex").slice(0, 16);
           const resultKey = `${cmds.map((c) => normCmd(c.cmd)).join("|")}::${resultHash}`;
           const unchangedCount = (commandResultCount.get(resultKey) ?? 0) + 1;
@@ -117360,9 +117406,11 @@ ${out}
           const anySucceeded = cmdResults.some((r2) => /\[(?:SUCCESS|NO_MATCH|DIFFERENCES_FOUND|CONDITION_FALSE); exit/.test(r2));
           if (anySucceeded) {
             consecutiveFailBatches = 0;
-            await completeRunTask(task, { commandBatch: "completed", successfulCommands: cmdResults.filter((r2) => /\[(?:SUCCESS|NO_MATCH|DIFFERENCES_FOUND|CONDITION_FALSE); exit/.test(r2)).length });
+            if (task.isSslTask) await applySslRunEvidence(task, cmdResults);
+            else await completeRunTask(task, { commandBatch: "completed", successfulCommands: cmdResults.filter((r2) => /\[(?:SUCCESS|NO_MATCH|DIFFERENCES_FOUND|CONDITION_FALSE); exit/.test(r2)).length });
           } else if (allFailed) {
             consecutiveFailBatches++;
+            if (task.isSslTask) await applySslRunEvidence(task, cmdResults);
           }
           const BLOCKER_PATTERNS = [
             /bash:\s*\S+:\s*command not found/i,
@@ -118405,6 +118453,27 @@ For each failure:
           const userTask = (parsed.data.messages[parsed.data.messages.length - 1]?.content ?? "").toLowerCase();
           const doneMsg = action.message ?? "";
           const doneMsgLower = doneMsg.toLowerCase();
+          if (task.isSslTask && task.durableTaskDbId) {
+            const sslPassed = task.acceptance.filter(item => item.status === "passed" && item.evidence?.length).length;
+            const sslRequired = task.acceptance.filter(item => item.required !== false).length;
+            if (sslPassed < sslRequired && doneAttempts < 3) {
+              doneAttempts++;
+              const remaining = task.acceptance.filter(item => item.status !== "passed").map(item => `- ${item.title}`).join("\n");
+              aiMessages.push({ role: "assistant", content: raw }, { role: "user", content: `[SSL COMPLETION GATE]
+Certificate installation is not complete. SSH authentication, a Certbot invocation, source inspection, HTTP reachability, and insecure curl are not user acceptance evidence.
+Continue automatically with the smallest safe recovery path. Detect the real web server/control panel, inspect the active vhost and current SNI certificate, test a scoped ACME challenge file, fix only ${task.sslDomain}, retry issuance only after state changes, then verify SAN, chain, normal HTTPS and renewal.
+Required evidence still missing:
+${remaining}
+Do not ask whether to continue. Do not inspect application source or Git history.` });
+              chatTaskEmit(task, "efficiency_warning", { type: "ssl_completion_gate", attempt: doneAttempts, passed: sslPassed, required: sslRequired });
+              continue;
+            }
+            if (sslPassed < sslRequired) {
+              const external = /dns[^\n]*(?:different|wrong|mismatch|another server)|control panel[^\n]*(?:denied|unavailable)|rate limit/i.test(doneMsgLower);
+              task.status = external ? "blocked" : "failed";
+              action.message = external ? `Blocked. SSL could not be installed because a verified external DNS or control-panel restriction remains. No certificate was claimed as installed.` : `Failed. SSL was not installed and verified for ${task.sslDomain}. The required certificate, hostname, chain, public HTTPS, and renewal checks did not all pass.`;
+            }
+          }
           if (/\bdeploy|deployment|publish|production\b/i.test(userTaskText) && task.durableTaskDbId) {
             const remainingTodos = await pool.query("SELECT title FROM agent_task_items WHERE task_id=$1 AND status IN ('pending','in_progress') ORDER BY position", [task.durableTaskDbId]);
             if (remainingTodos.rowCount && doneAttempts < 3) {

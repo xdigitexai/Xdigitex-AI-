@@ -10,9 +10,9 @@ test("non-streaming planner does not reference an undeclared transport stream", 
 });
 
 test("server agent applies bounded cycle and command budgets", () => {
-  assert.match(source, /const maxIterations = taskComplexity/);
-  assert.match(source, /let softCommandBudget = taskComplexity/);
-  assert.match(source, /const hardCommandLimit = taskComplexity/);
+  assert.match(source, /const maxIterations = task\.isSslTask \? 14 : taskComplexity/);
+  assert.match(source, /let softCommandBudget = task\.isSslTask \? 16 : taskComplexity/);
+  assert.match(source, /const hardCommandLimit = task\.isSslTask \? 32 : taskComplexity/);
   assert.match(source, /No-progress loop detected/);
 });
 
@@ -25,7 +25,7 @@ test("runtime failures log correlated stack details but return a safe message", 
 test("simple known-file work uses the fast path and skips generic knowledge", () => {
   assert.match(source, /const simpleTaskFastPath =/);
   assert.match(source, /Inspect this exact source file first/);
-  assert.match(source, /simpleTaskFastPath \? Promise\.resolve\(\[\]\)/);
+  assert.match(source, /simpleTaskFastPath \|\| task\.isSslTask \? Promise\.resolve\(\[\]\)/);
   assert.match(source, /taskComplexity === "simple" \? 1 : 3/);
 });
 

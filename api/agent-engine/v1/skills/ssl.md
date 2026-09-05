@@ -1,0 +1,2 @@
+# SSL
+Inspect DNS A/AAAA against the bound server, port 443 SNI certificate issuer/SAN/expiry/chain, actual web server, vhost and document root. For cPanel prefer AutoSSL or supported APIs; otherwise use the detected Nginx/Apache/LiteSpeed mechanism. Test `/.well-known/acme-challenge/xdigitex-test` before issuance and remove it afterward. Validate server configuration before a scoped reload. Final proof requires normal hostname verification, SAN coverage, valid chain, correct site and renewal; `curl -k` and SSH authentication never count.
